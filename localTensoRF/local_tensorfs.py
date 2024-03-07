@@ -5,11 +5,13 @@ import math
 import torch
 from models.tensorBase import AlphaGridMask
 
-from models.tensoRF import TensorVMSplit
+from models.tensoRF import TensorVMSplit, TensorVMSplit_TimeEmbedding
 
 from utils.utils import mtx_to_sixD, sixD_to_mtx
 from utils.ray_utils import get_ray_directions_lean, get_rays_lean, get_ray_directions_360
 from utils.utils import N_to_reso
+from utils.renderer import raw2outputs, induce_flow
+from utils.utils import TVLoss, compute_depth_loss
 
 def ids2pixel_view(W, H, ids):
     """
@@ -53,11 +55,11 @@ class LocalTensorfs(torch.nn.Module):
         camera_prior,
         device,
         lr_upsample_reset,
+        args,
         **tensorf_args,
     ):
-
         super(LocalTensorfs, self).__init__()
-
+        self.args = args
         self.fov = fov
         self.n_init_frames = n_init_frames
         self.n_overlap = n_overlap
@@ -109,6 +111,8 @@ class LocalTensorfs(torch.nn.Module):
 
         # Setup radiance fields
         self.tensorfs = torch.nn.ParameterList()
+        if self.args.use_dynamic:
+            self.tensorfs_dynamic = torch.nn.ParameterList()
         self.rf_iter = []
         self.world2rf = torch.nn.ParameterList()
         self.append_rf()
@@ -135,6 +139,8 @@ class LocalTensorfs(torch.nn.Module):
             world2rf = torch.zeros(3, device=self.device)
 
         self.tensorfs.append(TensorVMSplit(device=self.device, **self.tensorf_args))
+        if self.args.use_dynamic:
+            self.tensorfs_dynamic.append(TensorVMSplit_TimeEmbedding(device=self.device, **self.tensorf_args))
 
         self.world2rf.append(world2rf.clone().detach())
         
@@ -143,8 +149,10 @@ class LocalTensorfs(torch.nn.Module):
         grad_vars = self.tensorfs[-1].get_optparam_groups(
             self.rf_lr_init, self.rf_lr_basis
         )
+        if self.args.use_dynamic:
+            grad_vars.extend(self.tensorfs_dynamic[-1].get_optparam_groups(self.rf_lr_init, self.rf_lr_basis))
         self.rf_optimizer = (torch.optim.Adam(grad_vars, betas=(0.9, 0.99)))
-   
+
     def append_frame(self):
         if len(self.r_c2w) == 0:
             self.r_c2w.append(torch.eye(3, 2, device=self.device))
@@ -252,18 +260,24 @@ class LocalTensorfs(torch.nn.Module):
             n_voxels = self.N_voxel_list[self.rf_iter[-1]]
             reso_cur = N_to_reso(n_voxels, self.tensorfs[-1].aabb)
             self.tensorfs[-1].upsample_volume_grid(reso_cur)
+            if self.args.use_dynamic:
+                self.tensorfs_dynamic[-1].upsample_volume_grid(reso_cur)
 
             if self.lr_upsample_reset:
                 print("reset lr to initial")
                 grad_vars = self.tensorfs[-1].get_optparam_groups(
                     self.rf_lr_init, self.rf_lr_basis
                 )
+                if self.args.use_dynamic:
+                    grad_vars.extend(self.tensorfs_dynamic[-1].get_optparam_groups(self.lr_init, self.lr_basis))
                 self.rf_optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
 
         # Update alpha mask
         if self.rf_iter[-1] in self.update_AlphaMask_list:
             reso_mask = (self.tensorfs[-1].gridSize / 2).int()
             self.tensorfs[-1].updateAlphaMask(tuple(reso_mask))
+            if self.args.use_dynamic:
+                self.tensorfs_dynamic[-1].updateAlphaMask(tuple(reso_mask))
 
         for idx in range(len(self.r_optimizers)):
             if self.pose_linked_rf[idx] == len(self.rf_iter) - 1 and self.rf_iter[-1] < self.n_iters:
@@ -320,6 +334,8 @@ class LocalTensorfs(torch.nn.Module):
             "lr_upsample_reset": self.lr_upsample_reset,
         }
         kwargs.update(self.tensorfs[0].get_kwargs())
+        if self.args.use_dynamic:
+            kwargs.update(self.tensorfs_dynamic[0].get_kwargs())    
 
         return kwargs
 
@@ -344,6 +360,8 @@ class LocalTensorfs(torch.nn.Module):
                 alpha_volume = state_dict[f'tensorfs.{i}.alphaMask.alpha_volume'].to(self.device)
                 aabb = state_dict[f'tensorfs.{i}.alphaMask.aabb'].to(self.device)
                 self.tensorfs[i].alphaMask = AlphaGridMask(self.device, aabb, alpha_volume)
+                if self.args.use_dynamic:
+                    self.tensorfs_dynamic[i].alphaMask = AlphaGridMask(self.device, aabb, alpha_volume)
 
 
         for _ in range(n_frames - len(self.r_c2w)):
@@ -378,6 +396,567 @@ class LocalTensorfs(torch.nn.Module):
         return self.init_focal * self.focal_offset * W / self.W 
     def center(self, W, H):
         return torch.Tensor([W, H]).to(self.center_rel) * self.center_rel
+    
+    def add_dynamic_forward(
+        self,
+        iteration, # iter
+        tensorf_static,
+        tensorf_dynamic,
+        rgb_train, # rgb监督
+        flow_f_train, # 前向光流监督 get from dataset
+        flow_mask_f_train, # flowmask
+        flow_b_train,
+        flow_mask_b_train,
+        v_ref,# 列
+        u_ref,# 横
+        allforegroundmasks_train, # mask
+        focal_refine, # focal
+        t_interval, # 时间间隔
+        Temp,
+        Temp_static,
+        Temp_disp_TV,
+        H,
+        W,
+        loss_weights,
+        grid_train,
+        
+        view_ids,# image_id
+        rays,
+        ts_train,
+        is_train,
+        white_bg,
+        N_samples,
+        refine,
+        floater_thresh,
+        ):
+        total_loss=0
+        monodepth_weight_static=0.04
+        monodepth_weight_dynamic=0.04
+        tvreg = TVLoss()
+        if view_ids==0:
+            allposes_refine_f_train = self.get_cam2world(view_ids)
+        else:
+            allposes_refine_f_train = self.get_cam2world(view_ids-1)
+        if view_ids==len(self.r_c2w)-1: 
+            allposes_refine_b_train = self.get_cam2world(view_ids)
+        else:
+            allposes_refine_b_train = self.get_cam2world(view_ids+1)
+        _, _, _, _, _, _, rgb_points_static, sigmas_static, _, _ = tensorf_static(
+            rays.detach(),
+            ts_train,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            N_samples=-1,
+            refine=self.is_refining,
+            floater_thresh=floater_thresh,
+        )
+        # dynamic tensorf
+        (
+            _,
+            _,
+            blending,
+            pts_ref,
+            _,
+            _,
+            rgb_points_dynamic,
+            sigmas_dynamic,
+            z_vals_dynamic,
+            dists_dynamic,
+        ) = tensorf_dynamic(
+            rays.detach(),
+            ts_train,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            N_samples=-1,
+        )
+        (
+            rgb_map_full,
+            _,
+            _,
+            _,
+            rgb_map_s,
+            depth_map_s,
+            _,
+            weights_s,
+            rgb_map_d,
+            depth_map_d,
+            _,
+            weights_d,
+            dynamicness_map,
+        ) = raw2outputs(
+            rgb_points_static.detach(),
+            sigmas_static.detach(),
+            rgb_points_dynamic,
+            sigmas_dynamic,
+            dists_dynamic,
+            blending,
+            z_vals_dynamic,
+            rays.detach(),
+            is_train=True,
+            ray_type="contract",
+        )
+        loss_rgb = 0.25 * ((torch.abs(rgb_map_full - rgb_train)) * loss_weights) / loss_weights.mean()
+        # loss_rgb = torch.mean((rgb_map_full - rgb_train) ** 2)
+        total_loss += loss_rgb
+        img_d_loss = 0.25 * ((torch.abs(rgb_map_d - rgb_train)) * loss_weights) / loss_weights.mean()
+        # img_d_loss = torch.mean((rgb_map_d - rgb_train) ** 2)
+        total_loss += 1.0*img_d_loss
+
+        scene_flow_f, scene_flow_b = tensorf_dynamic.get_forward_backward_scene_flow(
+            pts_ref, ts_train.to(self.device)
+        )
+        # Flow grouping loss
+        # mask loss
+        if iteration >= 2000:
+            mask_loss = torch.mean(
+                torch.abs(dynamicness_map - allforegroundmasks_train[..., 0])
+            )
+            total_loss += 0.1 * mask_loss * Temp_disp_TV
+        if iteration >= 10000:
+            # skewed mask loss
+            clamped_mask = torch.clamp(dynamicness_map, min=1e-6, max=1.0 - 1e-6)
+            skewed_mask_loss = torch.mean(
+                -(
+                    (clamped_mask**2) * torch.log((clamped_mask**2))
+                    + (1 - (clamped_mask**2)) * torch.log(1 - (clamped_mask**2))
+                )
+            )
+            total_loss += 0.01 * skewed_mask_loss
+
+            mask_L1_reg_loss = torch.mean(torch.abs(dynamicness_map))
+            total_loss += 0.01 * mask_L1_reg_loss
+        # forward backward flow
+        pts_f = torch.clamp(pts_ref + scene_flow_f, min=-2.0 + 1e-6, max=2.0 - 1e-6)
+        pts_b = torch.clamp(pts_ref + scene_flow_b, min=-2.0 + 1e-6, max=2.0 - 1e-6)
+        
+        induced_flow_f, induced_disp_f = induce_flow(
+            H,
+            W,
+            focal_refine.detach(),
+            allposes_refine_f_train.detach(),# pose
+            weights_d,
+            pts_f,
+            grid_train,
+            rays.detach(),
+            ray_type="contract",
+        )
+        flow_f_loss = (
+            torch.sum(torch.abs(induced_flow_f - flow_f_train) * flow_mask_f_train)
+            / (torch.sum(flow_mask_f_train) + 1e-8)
+            / flow_f_train.shape[-1]
+        )
+        total_loss += 0.02 * flow_f_loss * Temp
+        induced_flow_b, induced_disp_b = induce_flow(
+            H,
+            W,
+            focal_refine.detach(),
+            allposes_refine_b_train.detach(),
+            weights_d,
+            pts_b,
+            grid_train,
+            rays.detach(),
+            ray_type="contract",
+        )
+        flow_b_loss = (
+            torch.sum(torch.abs(induced_flow_b - flow_b_train) * flow_mask_b_train)
+            / (torch.sum(flow_mask_b_train) + 1e-8)
+            / flow_b_train.shape[-1]
+        )
+        total_loss += 0.02 * flow_b_loss * Temp
+
+        # disparity loss
+        # forward
+        uv_f = (
+            torch.stack((v_ref + 0.5, u_ref + 0.5), -1).to(flow_f_train.device)
+            + flow_f_train
+        )
+        directions_f = torch.stack(
+            [
+                (uv_f[..., 0] - W / 2) / (focal_refine.detach()),
+                -(uv_f[..., 1] - H / 2) / (focal_refine.detach()),
+                -torch.ones_like(uv_f[..., 0]),
+            ],
+            -1,
+        )  # (H, W, 3)
+        rays_f_o, rays_f_d = get_rays_lean(directions_f, allposes_refine_f_train)
+        rays_f_train = torch.cat([rays_f_o, rays_f_d], -1).view(-1, 6)
+        _, _, _, _, _, _, rgb_points_static_f, sigmas_static_f, _, _ = tensorf_static(
+            rays_f_train.detach(),
+            ts_train + t_interval,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        (
+            _,
+            _,
+            blending_f,
+            pts_ref_ff,
+            _,
+            _,
+            rgb_points_dynamic_f,
+            sigmas_dynamic_f,
+            z_vals_dynamic_f,
+            dists_dynamic_f,
+        ) = tensorf_dynamic(
+            rays_f_train.detach(),
+            ts_train + t_interval,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        _, _, _, _, _, _, _, _, _, _, _, weights_d_f, _ = raw2outputs(
+            rgb_points_static_f.detach(),
+            sigmas_static_f.detach(),
+            rgb_points_dynamic_f,
+            sigmas_dynamic_f,
+            dists_dynamic_f,
+            blending_f,
+            z_vals_dynamic_f,
+            rays_f_train.detach(),
+            is_train=True,
+            ray_type="contract",
+        )
+        _, induced_disp_ff = induce_flow(
+            H,
+            W,
+            focal_refine.detach(),
+            allposes_refine_f_train.detach(),
+            weights_d_f,
+            pts_ref_ff,
+            grid_train,
+            rays_f_train.detach(),
+            ray_type="contract",
+        )
+        disp_f_loss = torch.sum(
+            torch.abs(induced_disp_f - induced_disp_ff) * flow_mask_f_train
+        ) / (torch.sum(flow_mask_f_train) + 1e-8)
+        total_loss += 0.04 * disp_f_loss * Temp
+        # backward
+        uv_b = (
+            torch.stack((v_ref + 0.5, u_ref + 0.5), -1).to(flow_b_train.device)
+            + flow_b_train
+        )
+        directions_b = torch.stack(
+            [
+                (uv_b[..., 0] - W / 2) / (focal_refine.detach()),
+                -(uv_b[..., 1] - H / 2) / (focal_refine.detach()),
+                -torch.ones_like(uv_b[..., 0]),
+            ],
+            -1,
+        )  # (H, W, 3)
+        rays_b_o, rays_b_d = get_rays_lean(directions_b, allposes_refine_b_train)
+        rays_b_train = torch.cat([rays_b_o, rays_b_d], -1).view(-1, 6)
+        _, _, _, _, _, _, rgb_points_static_b, sigmas_static_b, _, _ = tensorf_static(
+            rays_b_train.detach(),
+            ts_train - t_interval,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        (
+            _,
+            _,
+            blending_b,
+            pts_ref_bb,
+            _,
+            _,
+            rgb_points_dynamic_b,
+            sigmas_dynamic_b,
+            z_vals_dynamic_b,
+            dists_dynamic_b,
+        ) = tensorf_dynamic(
+            rays_b_train.detach(),
+            ts_train - t_interval,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        _, _, _, _, _, _, _, _, _, _, _, weights_d_b, _ = raw2outputs(
+            rgb_points_static_b.detach(),
+            sigmas_static_b.detach(),
+            rgb_points_dynamic_b,
+            sigmas_dynamic_b,
+            dists_dynamic_b,
+            blending_b,
+            z_vals_dynamic_b,
+            rays_b_train.detach(),
+            is_train=True,
+            ray_type="contract",
+        )
+        _, induced_disp_bb = induce_flow(
+            H,
+            W,
+            focal_refine.detach(),
+            allposes_refine_b_train.detach(),
+            weights_d_b,
+            pts_ref_bb,
+            grid_train,
+            rays_b_train.detach(),
+            ray_type="contract",
+        )
+        disp_b_loss = torch.sum(
+            torch.abs(induced_disp_b - induced_disp_bb) * flow_mask_b_train
+        ) / (torch.sum(flow_mask_b_train) + 1e-8)
+        total_loss += 0.04 * disp_b_loss * Temp
+
+        smooth_scene_flow_loss = torch.mean(torch.abs(scene_flow_f + scene_flow_b))
+        total_loss += smooth_scene_flow_loss * 0.1
+
+        # monocular depth loss
+        # total_mono_depth_loss += compute_depth_loss(
+        #                 1.0 / (depth_map_d[valid] + 1e-6), alldisps_train[valid]
+        #             )
+        # total_loss += total_mono_depth_loss * monodepth_weight_dynamic * Temp
+        # adaptive Order loss
+        order_loss = torch.sum(
+                (
+                    (1.0 / (depth_map_d + 1e-6) - 1.0 / (depth_map_s.detach() + 1e-6))
+                    ** 2
+                )
+                * (1.0 - dynamicness_map.detach())
+            ) / (torch.sum((1.0 - dynamicness_map.detach())) + 1e-8)
+        total_loss += order_loss * 10.0
+        
+        # static part for pose estimation
+        # static tensorf
+        (
+            _,
+            _,
+            _,
+            pts_ref_s,
+            _,
+            _,
+            rgb_points_static,
+            sigmas_static,
+            _,
+            _,
+        ) = tensorf_static(
+            rays,
+            ts_train,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        # dynamic tensorf
+        (
+            _,
+            _,
+            blending,
+            pts_ref,
+            _,
+            _,
+            rgb_points_dynamic,
+            sigmas_dynamic,
+            z_vals_dynamic,
+            dists_dynamic,
+        ) = tensorf_dynamic(
+            rays,
+            ts_train,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+
+        _, _, _, _, rgb_map_s, depth_map_s, _, weights_s, _, _, _, _, _ = raw2outputs(
+            rgb_points_static,
+            sigmas_static,
+            rgb_points_dynamic,
+            sigmas_dynamic,
+            dists_dynamic,
+            blending,
+            z_vals_dynamic,
+            rays,
+            is_train=True,
+            ray_type="contract",
+        )
+        ### static losses
+        # RGB loss
+        img_s_loss = (
+            torch.sum(
+                (rgb_map_s - rgb_train) ** 2
+                * (1.0 - allforegroundmasks_train[..., 0:1])
+            )
+            / (torch.sum((1.0 - allforegroundmasks_train[..., 0:1])) + 1e-8)
+            / rgb_map_s.shape[-1]
+        )
+        total_loss += 0.25 * img_s_loss
+        # optimize pose
+        induced_flow_f_s, induced_disp_f_s = induce_flow(
+                H,
+                W,
+                focal_refine,
+                allposes_refine_f_train,
+                weights_s,
+                pts_ref_s,
+                grid_train,
+                rays,
+                ray_type="contract",
+            )
+        flow_f_s_loss = (
+            torch.sum(
+                torch.abs(induced_flow_f_s - flow_f_train)
+                * flow_mask_f_train
+                * (1.0 - allforegroundmasks_train[..., 0:1])
+            )
+            / (
+                torch.sum(
+                    flow_mask_f_train * (1.0 - allforegroundmasks_train[..., 0:1])
+                )
+                + 1e-8
+            )
+            / flow_f_train.shape[-1]
+        )
+        total_loss += 0.02 * flow_f_s_loss * Temp_static
+        induced_flow_b_s, induced_disp_b_s = induce_flow(
+            H,
+            W,
+            focal_refine,
+            allposes_refine_b_train,
+            weights_s,
+            pts_ref_s,
+            grid_train,
+            rays,
+            ray_type="contract",
+        )
+        flow_b_s_loss = (
+            torch.sum(
+                torch.abs(induced_flow_b_s - flow_b_train)
+                * flow_mask_b_train
+                * (1.0 - allforegroundmasks_train[..., 0:1])
+            )
+            / (
+                torch.sum(
+                    flow_mask_b_train * (1.0 - allforegroundmasks_train[..., 0:1])
+                )
+                + 1e-8
+            )
+            / flow_b_train.shape[-1]
+        )
+        total_loss += 0.02 * flow_b_s_loss * Temp_static
+        # static disparity loss
+        # forward
+        uv_f = (
+            torch.stack((v_ref + 0.5, u_ref + 0.5), -1).to(flow_f_train.device)
+            + flow_f_train
+        )
+        directions_f = torch.stack(
+            [
+                (uv_f[..., 0] - W / 2) / (focal_refine),
+                -(uv_f[..., 1] - H / 2) / (focal_refine),
+                -torch.ones_like(uv_f[..., 0]),
+            ],
+            -1,
+        )  # (H, W, 3)
+        rays_f_o, rays_f_d = get_rays_lean(
+            directions_f, allposes_refine_f_train
+        )  # both (b, 3)
+        rays_f_train = torch.cat([rays_f_o, rays_f_d], -1).view(-1, 6)
+
+        _, _, _, pts_ref_s_ff, weights_s_ff, _, _, _, _, _ = tensorf_static(
+            rays_f_train,
+            ts_train,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        _, induced_disp_s_ff = induce_flow(
+            H,
+            W,
+            focal_refine,
+            allposes_refine_f_train,
+            weights_s_ff,
+            pts_ref_s_ff,
+            grid_train,
+            rays_f_train,
+            ray_type="contract",
+        )
+        disp_f_s_loss = torch.sum(
+            torch.abs(induced_disp_f_s - induced_disp_s_ff)
+            * flow_mask_f_train
+            * (1.0 - allforegroundmasks_train[..., 0:1])
+        ) / (
+            torch.sum(
+                flow_mask_f_train * (1.0 - allforegroundmasks_train[..., 0:1])
+            )
+            + 1e-8
+        )
+        total_loss += 0.04 * disp_f_s_loss * Temp_static
+        # backward
+        uv_b = (
+            torch.stack((v_ref + 0.5, u_ref + 0.5), -1).to(flow_b_train.device)
+            + flow_b_train
+        )
+        directions_b = torch.stack(
+            [
+                (uv_b[..., 0] - W / 2) / (focal_refine),
+                -(uv_b[..., 1] - H / 2) / (focal_refine),
+                -torch.ones_like(uv_b[..., 0]),
+            ],
+            -1,
+        )  # (H, W, 3)
+        rays_b_o, rays_b_d = get_rays_lean(
+            directions_b, allposes_refine_b_train
+        )  # both (b, 3)
+        rays_b_train = torch.cat([rays_b_o, rays_b_d], -1).view(-1, 6)
+        _, _, _, pts_ref_s_bb, weights_s_bb, _, _, _, _, _ = tensorf_static(
+            rays_b_train,
+            ts_train,
+            None,
+            is_train=True,
+            white_bg=white_bg,
+            ray_type="contract",
+            N_samples=-1,
+        )
+        _, induced_disp_s_bb = induce_flow(
+            H,
+            W,
+            focal_refine,
+            allposes_refine_b_train,
+            weights_s_bb,
+            pts_ref_s_bb,
+            grid_train,
+            rays_b_train,
+            ray_type="contract",
+        )
+        disp_b_s_loss = torch.sum(
+            torch.abs(induced_disp_b_s - induced_disp_s_bb)
+            * flow_mask_b_train
+            * (1.0 - allforegroundmasks_train[..., 0:1])
+        ) / (
+            torch.sum(
+                flow_mask_b_train * (1.0 - allforegroundmasks_train[..., 0:1])
+            )
+            + 1e-8
+        )
+        total_loss += 0.04 * disp_b_s_loss * Temp_static
+
+        return total_loss, depth_map_d, depth_map_s
+        # Monocular depth loss with mask for static TensoRF
+        # total_mono_depth_loss += compute_depth_loss(
+        #                     1.0 / (depth_map_s[valid] + 1e-6), alldisps_train[valid]
+        #                 )
+        # counter += torch.sum(valid)
+        # total_mono_depth_loss = total_mono_depth_loss / counter
+        # total_loss += (
+        #     total_mono_depth_loss * monodepth_weight_static * Temp_static
+        # )
 
     def forward(
         self,
@@ -385,6 +964,7 @@ class LocalTensorfs(torch.nn.Module):
         view_ids,
         W,
         H,
+        ts=None,
         white_bg=True,
         is_train=True,
         cam2world=None,
@@ -436,8 +1016,13 @@ class LocalTensorfs(torch.nn.Module):
         for key in cam2rfs:
             cam2rfs[key] = cam2rfs[key].repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
         blending_weights_expanded = blending_weights.repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
+        rgbs_static = torch.zeros_like(directions)
+        depth_maps_static = torch.zeros_like(directions[..., 0])
+        rgbs_dynamic = torch.zeros_like(directions)
+        depth_maps_dynamic = torch.zeros_like(directions[..., 0])
         rgbs = torch.zeros_like(directions) 
         depth_maps = torch.zeros_like(directions[..., 0]) 
+        mask = torch.zeros_like(directions[..., 0])
         N_rays_all = ray_ids.shape[0]
         chunk = chunk // len(active_rf_ids)
         for chunk_idx in range(N_rays_all // chunk + int(N_rays_all % chunk > 0)):
@@ -447,6 +1032,7 @@ class LocalTensorfs(torch.nn.Module):
             blending_weights_chunk = blending_weights_expanded[
                 chunk_idx * chunk : (chunk_idx + 1) * chunk
             ]
+            ts_chunk = ts[chunk_idx * chunk : (chunk_idx + 1) * chunk] if ts is not None else None
 
             for rf_id in active_rf_ids:
                 blending_weight_chunk = blending_weights_chunk[:, rf_id]
@@ -454,24 +1040,82 @@ class LocalTensorfs(torch.nn.Module):
 
                 rays_o, rays_d = get_rays_lean(directions_chunk, cam2rf)
                 rays = torch.cat([rays_o, rays_d], -1).view(-1, 6)
-
-                rgb_map_t, depth_map_t = self.tensorfs[rf_id](
+                # 靠着这个学习pose
+                _, _, blending_s, pts_ref_s, weight_s, xyz_prime_s, rgb_s, sigma_s, z_vals_s, dists_s, rgb_map_t, depth_map_t = self.tensorfs[rf_id](
                     rays,
+                    ts_chunk=None,
                     is_train=is_train,
                     white_bg=white_bg,
                     N_samples=-1,
                     refine=self.is_refining,
                     floater_thresh=floater_thresh,
                 )
-
-                rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                    rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                    rgb_map_t * blending_weight_chunk[..., None]
-                )
-                depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                    depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                    depth_map_t * blending_weight_chunk
-                )
+                if self.args.use_dynamic:
+                    _, _, blending_d, pts_ref_d, weight_d, xyz_prime_d, rgb_d, sigma_d, z_vals_d, dists_d, _, _ = self.tensorfs_dynamic[rf_id](
+                        rays.detach(),
+                        ts_chunk=ts_chunk,
+                        timeembeddings_chunk=None,
+                        is_train=is_train,
+                        white_bg=white_bg,
+                        N_samples=-1,
+                        refine=self.is_refining,
+                        floater_thresh=floater_thresh,
+                    )
+                    (
+                        rgb_map_full,
+                        depth_map_full,
+                        _,
+                        _,
+                        rgb_map_s,
+                        depth_map_s,
+                        _,
+                        weights_s,
+                        rgb_map_d,
+                        depth_map_d,
+                        _,
+                        weights_d,
+                        dynamicness_map,
+                    )= raw2outputs(rgb_s, sigma_s, rgb_d, sigma_d, dists_d, blending_d, z_vals_d, rays, is_train=True, ray_type="contract")
+                # rgb_map_s和rgb_map_t是否一致
+                if self.args.use_dynamic:
+                    rgbs_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        rgbs_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        rgb_map_s * blending_weight_chunk[..., None]
+                    )
+                    depth_maps_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        depth_maps_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        depth_map_s * blending_weight_chunk
+                    )
+                    rgbs_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        rgbs_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        rgb_map_d * blending_weight_chunk[..., None]
+                    )
+                    depth_maps_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        depth_maps_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        depth_map_d * blending_weight_chunk
+                    )
+                    rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        rgb_map_full * blending_weight_chunk[..., None]
+                    )
+                    depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        depth_map_full * blending_weight_chunk
+                    )
+                    # mask
+                    mask[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        mask[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        dynamicness_map * blending_weight_chunk
+                    )
+                else:
+                    rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        rgb_map_t * blending_weight_chunk[..., None]
+                    )
+                    depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                        depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                        depth_map_t * blending_weight_chunk
+                    )
 
         for rf_id, initial_device in zip(active_rf_ids, initial_devices):
             if initial_device != view_ids.device:
@@ -494,6 +1138,14 @@ class LocalTensorfs(torch.nn.Module):
                 
             exposure = exposure.repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
             rgbs = torch.bmm(exposure, rgbs[..., None])[..., 0]
+            if self.args.use_dynamic:
+                rgbs_dynamic = torch.bmm(exposure, rgbs_dynamic[..., None])[..., 0]
+                rgbs_static = torch.bmm(exposure, rgbs_static[..., None])[..., 0]
+                rgbs_dynamic = rgbs_dynamic.clamp(0, 1)
+                rgbs_static = rgbs_static.clamp(0, 1)
+            else:
+                rgbs_dynamic=None
+                rgbs_static=None
         rgbs = rgbs.clamp(0, 1)
 
-        return rgbs, depth_maps, directions, ij
+        return rgbs, depth_maps, rgbs_static, depth_maps_static, rgbs_dynamic, depth_maps_dynamic, mask, directions, ij

@@ -43,6 +43,7 @@ class LocalRFDataset(Dataset):
         self.load_depth = load_depth
         self.load_flow = load_flow
         self.frame_step = frame_step
+        self.n_init_frames = n_init_frames
 
         if with_preprocessed_poses:
             with open(os.path.join(self.root_dir, "transforms.json"), 'r') as f:
@@ -71,6 +72,8 @@ class LocalRFDataset(Dataset):
 
         else:
             self.image_paths = sorted(os.listdir(os.path.join(self.root_dir, "images")))
+        self.image_paths = [f for f in self.image_paths if f.split("_")[-1]=="0.jpg"]
+        
         if subsequence != [0, -1]:
             self.image_paths = self.image_paths[subsequence[0]:subsequence[1]]
 
@@ -99,7 +102,10 @@ class LocalRFDataset(Dataset):
 
         self.near_far = [0.1, 1e3] # Dummi
         self.scene_bbox = 2 * torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
-
+        # self.scene_bbox = 2 * torch.tensor([[-20, -20, -20], [20, 20, 20]])
+        
+        self.all_ts = None
+        self.all_masks = None
         self.all_rgbs = None
         self.all_invdepths = None
         self.all_fwd_flow, self.all_fwd_mask, self.all_bwd_flow, self.all_bwd_mask = None, None, None, None
@@ -143,11 +149,10 @@ class LocalRFDataset(Dataset):
     def read_meta(self):
         def read_image(i):
             image_path = os.path.join(self.root_dir, "images", self.image_paths[i])
-            motion_mask_path = os.path.join(self.root_dir, "masks", 
+            motion_mask_path = os.path.join(self.root_dir, "dynamic_masks", 
                 f"{os.path.splitext(self.image_paths[i])[0]}.png")
             if not os.path.isfile(motion_mask_path):
                 motion_mask_path = os.path.join(self.root_dir, "masks/all.png")
-
 
             img = cv2.imread(image_path)[..., ::-1]
             img = img.astype(np.float32) / 255
@@ -164,7 +169,8 @@ class LocalRFDataset(Dataset):
                     invdepth, tuple(img.shape[1::-1]), interpolation=cv2.INTER_AREA)
             else:
                 invdepth = None
-
+            # 加载robust时间
+            ts = (i / (len(self.all_image_paths) - 1) * 2.0 - 1.0) * torch.ones(img.shape[0], img.shape[1])  # (h*w, 1)
             if self.load_flow:
                 glob_idx = self.all_image_paths.index(self.image_paths[i])
                 if glob_idx+1 < len(self.all_image_paths):
@@ -204,6 +210,7 @@ class LocalRFDataset(Dataset):
                 mask = None
 
             return {
+                "ts": ts,
                 "img": img, 
                 "invdepth": invdepth,
                 "fwd_flow": fwd_flow,
@@ -219,6 +226,7 @@ class LocalRFDataset(Dataset):
         )
         self.loaded_frames += n_frames_to_load
         all_rgbs = [data["img"] for data in all_data]
+        all_ts = [data["ts"] for data in all_data] # for dynamic
         all_invdepths = [data["invdepth"] for data in all_data]
         all_fwd_flow = [data["fwd_flow"] for data in all_data]
         all_fwd_mask = [data["fwd_mask"] for data in all_data]
@@ -232,13 +240,16 @@ class LocalRFDataset(Dataset):
                         ).var()
             for img in all_rgbs
         ]
-        all_loss_weights = [laplacian if mask is None else laplacian * mask for laplacian, mask in zip(all_laplacian, all_mask)]
+        all_loss_weights = [laplacian for laplacian, mask in zip(all_laplacian, all_mask)]
+        # all_loss_weights = [laplacian if mask is None else laplacian * mask for laplacian, mask in zip(all_laplacian, all_mask)]
 
         self.img_wh = list(all_rgbs[0].shape[1::-1])
         self.n_px_per_frame = self.img_wh[0] * self.img_wh[1]
 
         if self.split != "train":
             self.all_rgbs = np.stack(all_rgbs, 0)
+            self.all_ts = np.stack(all_ts, 0)
+            self.all_masks = np.stack(all_mask, 0)
             if self.load_depth:
                 self.all_invdepths = np.stack(all_invdepths, 0)
             if self.load_flow:
@@ -247,6 +258,8 @@ class LocalRFDataset(Dataset):
                 self.all_bwd_flow = np.stack(all_bwd_flow, 0)
                 self.all_bwd_mask = np.stack(all_bwd_mask, 0)
         else:
+            self.all_masks = concatenate_append(self.all_masks, all_mask, 1)
+            self.all_ts = concatenate_append(self.all_ts, all_ts, 1)
             self.all_rgbs = concatenate_append(self.all_rgbs, all_rgbs, 3)
             if self.load_depth:
                 self.all_invdepths = concatenate_append(self.all_invdepths, all_invdepths, 1)
@@ -303,6 +316,8 @@ class LocalRFDataset(Dataset):
         idx_sample = idx - self.active_frames_bounds[0] * self.n_px_per_frame
 
         return {
+            "mask": self.all_masks[idx_sample],
+            "ts": self.all_ts[idx_sample],
             "rgbs": self.all_rgbs[idx_sample], 
             "loss_weights": self.all_loss_weights[idx_sample], 
             "invdepths": self.all_invdepths[idx_sample] if self.load_depth else None,

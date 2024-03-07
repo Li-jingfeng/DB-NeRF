@@ -22,7 +22,18 @@ def get_ray_directions_lean(i, j, focal, center):
     i, j = i.float() + 0.5, j.float() + 0.5
     directions = torch.stack([(i - center[0]) / focal, -(j - center[1]) / focal, -torch.ones_like(i)], -1)  # (b, 3)
     return directions
-
+# def get_ray_directions_lean(i, j, focal, center):
+#     """
+#     get_ray_directions but returns only relevant rays
+#     Inputs:
+#         focal: (2), focal length
+#     Outputs:
+#         directions: (b, 3), the direction of the rays in camera coordinate
+#     """
+#     i, j = i.float() + 0.5, j.float() + 0.5
+#     directions = torch.stack([(i - center[0]) / focal, (j - center[1]) / focal, torch.ones_like(i)], -1)  # (b, 3)
+#     return directions
+    
 def sphere2xyz(r, theta, phi):
     x = torch.cos(phi) * torch.sin(theta)
     y = torch.sin(phi)

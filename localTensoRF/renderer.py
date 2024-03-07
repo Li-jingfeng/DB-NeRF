@@ -56,13 +56,14 @@ def render(
     metrics = {}
     print(f"Render {len(idxs)} frame with size {W} x {H}")
     for i, idx in tqdm(enumerate(idxs)):
+        rays_ts = (idx / (len(train_dataset.all_image_paths) - 1) * 2.0 - 1.0) * torch.ones(H, W).view(-1).to(rays_ids.device)
         torch.cuda.empty_cache()
         if frame_indices is None:
             view_ids = torch.Tensor([idx]).to(poses_mtx).long()
         else:
             view_ids = frame_indices[idx][None]
-
-        rgb_map, depth_map, directions, ij = local_tensorfs(
+        # rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij
+        rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij = local_tensorfs(
             rays_ids,
             view_ids,
             W,
@@ -74,6 +75,7 @@ def render(
             test_id=test or is_test_id[view_ids.item()],
             chunk=args.batch_size,
             floater_thresh=floater_thresh,
+            ts=rays_ts,
         )              
         
         if test and add_frame_to_list:
@@ -127,6 +129,19 @@ def render(
         rgb_map, depth_map = rgb_map.reshape(H, W, 3), depth_map.reshape(H, W)
         depth_map_vis, _ = visualize_depth(depth_map.cpu().numpy(), [0, 5])
 
+        # RGB and depth visualization
+        if args.use_dynamic:
+            rgb_map_static, depth_map_static = rgb_static.reshape(H, W, 3), depth_map_static.reshape(H, W)
+            depth_map_static_vis, _ = visualize_depth(depth_map_static.cpu().numpy(), [0, 5])
+            rgb_map_static = rgb_map_static.detach().cpu()
+            depth_map_static_vis = torch.permute(depth_map_static_vis.detach().cpu() * 255, [1, 2, 0]).byte()
+
+            rgb_map_dynamic, depth_map_dynamic = rgb_dynamic.reshape(H, W, 3), depth_map_dynamic.reshape(H, W)
+            depth_map_dynamic_vis, _ = visualize_depth(depth_map_dynamic.cpu().numpy(), [0, 5])
+            rgb_map_dynamic = rgb_map_dynamic.detach().cpu()
+            depth_map_dynamic_vis = torch.permute(depth_map_dynamic_vis.detach().cpu() * 255, [1, 2, 0]).byte()
+
+
         rgb_map = rgb_map.detach().cpu()
         if annotate:
             rgb_map = (rgb_map.detach().cpu() * 255).byte().numpy()
@@ -171,9 +186,22 @@ def render(
                 fbase = f"{i:06d}"
             os.makedirs(f"{savePath}/rgb_maps", exist_ok=True)
             os.makedirs(f"{savePath}/depth_maps", exist_ok=True)
+            if args.use_dynamic:
+                os.makedirs(f"{savePath}/static_rgb_maps", exist_ok=True)
+                os.makedirs(f"{savePath}/static_depth_maps", exist_ok=True)
+                os.makedirs(f"{savePath}/dynamic_rgb_maps", exist_ok=True)
+                os.makedirs(f"{savePath}/dynamic_depth_maps", exist_ok=True)
+                os.makedirs(f"{savePath}/mask", exist_ok=True)
+
             cv2.imwrite(f"{savePath}/rgb_maps/{fbase}.{img_format}", 255 * rgb_map.numpy()[..., ::-1])
             cv2.imwrite(f"{savePath}/rgb_maps/{fbase}_pose.{img_format}", pose_vis[..., ::-1])
             cv2.imwrite(f"{savePath}/depth_maps/{fbase}.{img_format}", depth_map_vis.numpy()[..., ::-1])
+            if args.use_dynamic:
+                cv2.imwrite(f"{savePath}/static_rgb_maps/{fbase}.{img_format}", 255 * rgb_map_static.numpy()[..., ::-1])
+                cv2.imwrite(f"{savePath}/static_depth_maps/{fbase}.{img_format}", depth_map_static_vis.numpy()[..., ::-1])
+                cv2.imwrite(f"{savePath}/dynamic_rgb_maps/{fbase}.{img_format}", 255 * rgb_map_dynamic.numpy()[..., ::-1])
+                cv2.imwrite(f"{savePath}/dynamic_depth_maps/{fbase}.{img_format}", depth_map_dynamic_vis.numpy()[..., ::-1])
+                cv2.imwrite(f"{savePath}/mask/{fbase}.{img_format}", 255 * pred_mask.reshape(H, W).detach().cpu().numpy()[..., ::-1])
             if save_raw_depth:
                 cv2.imwrite(f"{savePath}/depth_maps/{fbase}.tiff", depth_map.cpu().numpy())
 

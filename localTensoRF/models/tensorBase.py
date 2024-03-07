@@ -514,6 +514,9 @@ class TensorBase(torch.nn.Module):
             alpha[i] = self.compute_alpha(dense_xyz[i].view(-1,3), self.stepSize).view((gridSize[1], gridSize[2]))
         return alpha
 
+    def warp_coordinate(self, xyz_sampled, t_sampled):
+        pass
+    
     @torch.no_grad()
     def updateAlphaMask(self, gridSize=(200,200,200)):
         torch.cuda.empty_cache()
@@ -563,10 +566,22 @@ class TensorBase(torch.nn.Module):
         if self.alphaMask is not None:
             self.alphaMask = self.alphaMask.to(device)
         return super(TensorBase, self).to(device)
+    
+    def normalize_coord(self, xyz_sampled):
+        return (
+            xyz_sampled - self.aabb.to(xyz_sampled.get_device())[0]
+        ) * self.invaabbSize.to(xyz_sampled.get_device()) - 1
+
+    def unnormalize_coord(self, xyz_sampled):
+        return (xyz_sampled + 1) / self.invaabbSize.to(
+            xyz_sampled.get_device()
+        ) + self.aabb.to(xyz_sampled.get_device())[0]
 
     def forward(
         self,
         rays_chunk,
+        ts_chunk=None,
+        timeembeddings_chunk=None,
         white_bg=True,
         is_train=False,
         N_samples=-1,
@@ -589,6 +604,7 @@ class TensorBase(torch.nn.Module):
 
         sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
         rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
+        blending = torch.zeros((*xyz_sampled.shape[:2], 1), device=xyz_sampled.device)
 
         if self.alphaMask is not None:
             alphas = self.alphaMask.sample_alpha(xyz_sampled[ray_valid])
@@ -600,12 +616,50 @@ class TensorBase(torch.nn.Module):
         ray_valid[:, -1] = 0
         if ray_valid.any():
             xyz_sampled = self.normalize_coord(xyz_sampled)
-            sigma_feature = self.compute_densityfeature(
-                xyz_sampled[ray_valid],
-            )
+            if timeembeddings_chunk is None:
+                if ts_chunk is None:
+                    sigma_feature = self.compute_densityfeature(
+                        xyz_sampled[ray_valid],
+                    )
 
-            validsigma = self.feature2density(sigma_feature)
-            sigma[ray_valid] = validsigma
+                    validsigma = self.feature2density(sigma_feature)
+                    sigma[ray_valid] = validsigma
+                else:
+                    sigma_feature = self.compute_densityfeature(
+                        xyz_sampled[ray_valid],
+                        torch.tile(
+                            torch.unsqueeze(ts_chunk, -1),
+                            (1, xyz_sampled.shape[1]),
+                        )[ray_valid],
+                        None,
+                    )
+                #     sigma_feature = self.compute_densityfeature(
+                #     xyz_sampled[ray_valid],
+                #     torch.tile(
+                #         torch.unsqueeze(ts_chunk, -1),
+                #         (1, xyz_sampled.shape[1]),
+                #     )[ray_valid],
+                #     torch.tile(
+                #         torch.unsqueeze(timeembeddings_chunk, 1),
+                #         (1, xyz_sampled.shape[1], 1),
+                #     )[ray_valid],
+                # )
+                    validsigma = self.feature2density(sigma_feature)
+                    sigma[ray_valid] = validsigma
+            else:
+                sigma_feature = self.compute_densityfeature(
+                    xyz_sampled[ray_valid],
+                    torch.tile(
+                        torch.unsqueeze(ts_chunk, -1),
+                        (1, xyz_sampled.shape[1]),
+                    )[ray_valid],
+                    torch.tile(
+                        torch.unsqueeze(timeembeddings_chunk, 1),
+                        (1, xyz_sampled.shape[1], 1),
+                    )[ray_valid],
+                )
+                validsigma = self.feature2density(sigma_feature)
+                sigma[ray_valid] = validsigma
 
         alpha = 1.0 - torch.exp(-sigma * dists * self.distance_scale)
             
@@ -621,16 +675,86 @@ class TensorBase(torch.nn.Module):
         
         app_mask = weight > self.rayMarch_weight_thres
         if app_mask.any():
-            app_features = self.compute_appfeature(
-                xyz_sampled[app_mask],
+            if ts_chunk is None:
+                app_features = self.compute_appfeature(
+                    xyz_sampled[app_mask],
+                )
+                valid_rgbs = self.renderModule(
+                        xyz_sampled[app_mask], viewdirs[app_mask].clone().detach(), app_features, refine
+                    )
+                rgb[app_mask] = valid_rgbs
+            else:
+                app_features = self.compute_appfeature(
+                    xyz_sampled[app_mask],
+                    torch.tile(
+                        torch.unsqueeze(ts_chunk, -1), (1, xyz_sampled.shape[1])
+                    )[app_mask],
+                    None,
+                )
+                if timeembeddings_chunk is not None:
+                    valid_rgbs = self.renderModule(
+                        xyz_sampled[app_mask],
+                        viewdirs[app_mask],
+                        app_features,
+                        torch.tile(
+                            torch.unsqueeze(timeembeddings_chunk, 1),
+                            (1, xyz_sampled.shape[1], 1),
+                        )[app_mask],
+                    )
+                    rgb[app_mask] = valid_rgbs
+                    
+        if ts_chunk is None:
+            xyz_prime=None
+        else:
+            xyz_prime = self.warp_coordinate(
+                xyz_sampled,
+                torch.tile(torch.unsqueeze(ts_chunk, -1), (1, xyz_sampled.shape[1])),
             )
-            valid_rgbs = self.renderModule(
-                xyz_sampled[app_mask], viewdirs[app_mask].clone().detach(), app_features, refine
+
+        pts_ref = xyz_sampled
+        if ts_chunk is None:
+            rgb_map = torch.sum(weight[..., None] * rgb, -2)
+            if white_bg or (is_train and torch.rand((1,)) < 0.5):
+                rgb_map = rgb_map + (1.0 - acc_map[..., None])
+
+        if xyz_prime is None:
+            return (
+                None,
+                None,
+                None,
+                pts_ref,
+                weight,
+                None,
+                rgb,
+                sigma,
+                z_vals,
+                dists * self.distance_scale,
+                rgb_map,
+                depth_map,
             )
-            rgb[app_mask] = valid_rgbs
+        if ray_valid.any():
+            blending_features = self.compute_blendingfeature(
+                xyz_sampled[ray_valid],
+                torch.tile(
+                    torch.unsqueeze(ts_chunk, -1), (1, xyz_sampled.shape[1])
+                )[ray_valid],
+                None,
+            )
+            blending[ray_valid] = torch.sigmoid(blending_features)[:, None]
 
-        rgb_map = torch.sum(weight[..., None] * rgb, -2)
-        if white_bg or (is_train and torch.rand((1,)) < 0.5):
-            rgb_map = rgb_map + (1.0 - acc_map[..., None])
 
-        return rgb_map, depth_map
+        # return rgb_map, depth_map
+        return (
+            None,
+            None,
+            blending[..., 0],
+            pts_ref,
+            weight,
+            xyz_prime,
+            rgb,
+            sigma,
+            z_vals,
+            dists * self.distance_scale,
+            None,
+            None,
+        )

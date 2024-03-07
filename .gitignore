@@ -145,3 +145,7 @@ comparison/FuSta/raft_models/raft-kitti.pth
 comparison/FuSta/raft_models/raft-sintel.pth
 comparison/FuSta/raft_models/raft-small.pth
 comparison/FuSta/raft_models/raft-things.pth
+log
+waymo_dynamic
+weights
+DPT

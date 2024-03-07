@@ -297,6 +297,7 @@ def reconstruction(args):
 
 
     local_tensorfs = LocalTensorfs(
+        args=args,
         camera_prior=camera_prior,
         fov=args.fov,
         n_init_frames=min(args.n_init_frames, train_dataset.num_images),
@@ -340,13 +341,27 @@ def reconstruction(args):
     tvreg = TVLoss()
     W, H = train_dataset.img_wh
 
+    # ii, jj = np.meshgrid(
+    #     np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing="xy"
+    # )
+    # grid = torch.from_numpy(np.stack([ii, jj], -1)).to(args.device)
+    # grid = torch.tile(torch.unsqueeze(grid, 0), (args.N_voxel_t, 1, 1, 1))
+    # allgrids = grid.view(-1, 2)
+
     training = True
     n_added_frames = 0
     last_add_iter = 0
     iteration = 0
     metrics = {}
     start_time = time.time()
+    if args.warmup:
+        args.use_dynamic = 0 # 首先禁止dynamic
     while training:
+        if args.warmup and iteration == 1000:
+            print("Start using dynamic mask")
+            args.use_dynamic = 1
+            train_dataset.active_frames_bounds[0], train_dataset.active_frames_bounds[1] = 0, train_dataset.n_init_frames
+
         optimize_poses = args.lr_R_init > 0 or args.lr_t_init > 0
         data_blob = train_dataset.sample(args.batch_size, local_tensorfs.is_refining, optimize_poses)
         view_ids = torch.from_numpy(data_blob["view_ids"]).to(args.device)
@@ -354,21 +369,38 @@ def reconstruction(args):
         loss_weights = torch.from_numpy(data_blob["loss_weights"]).to(args.device)
         train_test_poses = data_blob["train_test_poses"]
         ray_idx = torch.from_numpy(data_blob["idx"]).to(args.device)
+        rays_ts = torch.from_numpy(data_blob["ts"]).squeeze(1).to(args.device)
+        dynamic_mask = torch.from_numpy(data_blob["mask"]).squeeze(1).to(args.device)
         reg_loss_weight = local_tensorfs.lr_factor ** (local_tensorfs.rf_iter[-1])
-
-        rgb_map, depth_map, directions, ij = local_tensorfs(
+        
+        rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij = local_tensorfs(
             ray_idx,
             view_ids,
             W,
             H,
             is_train=True,
             test_id=train_test_poses,
+            ts=rays_ts,
         )
 
         # loss
-        loss = 0.25 * ((torch.abs(rgb_map - rgb_train)) * loss_weights) / loss_weights.mean()
-               
-        loss = loss.mean()
+        loss = (0.25 * ((torch.abs(rgb_map - rgb_train)) * loss_weights) / loss_weights.mean()).mean()
+        # mask
+        if args.use_dynamic:
+            # rgb static & dynamic loss
+            valid_s = dynamic_mask < 0.5
+            valid_d = torch.logical_not(valid_s)
+            loss += (0.25 * ((torch.abs(rgb_static[valid_s] - rgb_train[valid_s])) * loss_weights[valid_s]) / loss_weights[valid_s].mean()).mean()
+            loss += (0.25 * ((torch.abs(rgb_dynamic[valid_d] - rgb_train[valid_d])) * loss_weights[valid_d]) / loss_weights[valid_d].mean()).mean()
+
+            depth_map_static = depth_map_static.view(view_ids.shape[0], -1)
+            loss_weights = loss_weights.view(view_ids.shape[0], -1)
+            depth_map_static = depth_map_static.view(view_ids.shape[0], -1)
+
+            depth_map_dynamic = depth_map_dynamic.view(view_ids.shape[0], -1)
+            loss_weights = loss_weights.view(view_ids.shape[0], -1)
+            depth_map_dynamic = depth_map_dynamic.view(view_ids.shape[0], -1)
+        # loss = loss.mean()
         total_loss = loss
         writer.add_scalar("train/rgb_loss", loss, global_step=iteration)
 
@@ -378,7 +410,6 @@ def reconstruction(args):
             depth_map = depth_map.view(view_ids.shape[0], -1)
             loss_weights = loss_weights.view(view_ids.shape[0], -1)
             depth_map = depth_map.view(view_ids.shape[0], -1)
-
             writer.add_scalar("train/reg_loss_weights", reg_loss_weight, global_step=iteration)
 
         # Optical flow
@@ -415,13 +446,34 @@ def reconstruction(args):
                 raise NotImplementedError
             invdepths = torch.from_numpy(data_blob["invdepths"]).to(args.device)
             invdepths = invdepths.view(view_ids.shape[0], -1)
+
             _, _, depth_loss_arr = compute_depth_loss(1 / depth_map.clamp(1e-6), invdepths)
             depth_loss_arr[depth_loss_arr > torch.quantile(depth_loss_arr, 0.8, dim=1)[..., None]] = 0
 
             depth_loss = (depth_loss_arr).mean() * args.loss_depth_weight_inital * reg_loss_weight
             total_loss = total_loss + depth_loss 
             writer.add_scalar("train/depth_loss", depth_loss, global_step=iteration)
+            if args.use_dynamic:
+                dynamic_mask = dynamic_mask.view(view_ids.shape[0], -1)
+                valid_depth_s = dynamic_mask < 0.5
+                valid_depth_d = torch.logical_not(valid_depth_s)
 
+                _, _, depth_loss_arr_d = compute_depth_loss(1 / depth_map_dynamic[valid_depth_d].clamp(1e-6), invdepths[valid_depth_d])
+                # depth_loss_arr_d[depth_loss_arr_d > torch.quantile(depth_loss_arr_d, 0.8, dim=1)[..., None]] = 0
+                depth_loss_d = (depth_loss_arr_d).mean() * args.loss_depth_weight_inital * reg_loss_weight
+                total_loss = total_loss + depth_loss_d 
+
+                _, _, depth_loss_arr_s = compute_depth_loss(1 / depth_map_static[valid_depth_s].clamp(1e-6), invdepths[valid_depth_s])
+                # depth_loss_arr_s[depth_loss_arr_s > torch.quantile(depth_loss_arr_s, 0.8, dim=1)[..., None]] = 0
+                depth_loss_s = depth_loss_arr_s.mean() * args.loss_depth_weight_inital * reg_loss_weight
+                total_loss = total_loss + depth_loss_s
+
+                # dynamic mask
+                if iteration>1000:
+                    mask_loss = torch.mean(
+                        torch.abs(pred_mask - dynamic_mask.view(-1).to(torch.float32))
+                    )
+                    total_loss += 0.1*mask_loss
         if  local_tensorfs.regularize:
             loss_tv, l1_loss = local_tensorfs.get_reg_loss(tvreg, args.TV_weight_density, args.TV_weight_app, args.L1_weight)
             total_loss = total_loss + loss_tv + l1_loss
@@ -550,7 +602,7 @@ def reconstruction(args):
                 poses_mtx,
                 local_tensorfs,
                 args,
-                W=W // 2, H=H // 2,
+                W=int(W), H=int(H),
                 savePath=logfolder,
                 save_frames=True,
                 img_format="jpg",

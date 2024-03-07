@@ -195,6 +195,9 @@ def config_parser(cmd=None):
         "--vis_every", type=int, default=10000, help="Frequency of visualize the test images."
     )
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--use_dynamic", type=int, default=0, help="whether use time t")
+    parser.add_argument("--warmup", type=int, default=1, help="whether warmup")
+
     if cmd is not None:
         return parser.parse_args(cmd)
     else:
