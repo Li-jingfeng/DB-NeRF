@@ -3,7 +3,7 @@
 import math
 
 import torch
-from models.tensorBase import AlphaGridMask
+from models.tensorBase import AlphaGridMask 
 
 from models.tensoRF import TensorVMSplit, TensorVMSplit_TimeEmbedding
 
@@ -12,6 +12,12 @@ from utils.ray_utils import get_ray_directions_lean, get_rays_lean, get_ray_dire
 from utils.utils import N_to_reso
 from utils.renderer import raw2outputs, induce_flow
 from utils.utils import TVLoss, compute_depth_loss
+from models.render_utils import render_rays
+import builders
+from third_party.nerfacc_prop_net import PropNetEstimator, get_proposal_requires_grad_fn
+from models.video_utils import render_pixels, save_videos
+import loss
+import numpy as np
 
 def ids2pixel_view(W, H, ids):
     """
@@ -56,10 +62,14 @@ class LocalTensorfs(torch.nn.Module):
         device,
         lr_upsample_reset,
         args,
+        cfg,
+        dataset,
         **tensorf_args,
     ):
         super(LocalTensorfs, self).__init__()
+        self.dataset = dataset
         self.args = args
+        self.cfg = cfg
         self.fov = fov
         self.n_init_frames = n_init_frames
         self.n_overlap = n_overlap
@@ -82,6 +92,11 @@ class LocalTensorfs(torch.nn.Module):
         self.n_iters = self.n_iters_per_frame
         self.update_AlphaMask_list = update_AlphaMask_list
         self.N_voxel_list = N_voxel_list
+
+        self.frame_index = 0 # append_framne中添加vo的pose
+        mat = np.loadtxt("/data/ljf/localrf/kitti_04_gtposes.txt").reshape(-1,3,4)
+        self.r_mat = torch.tensor(mat[:, :3,:3],dtype=torch.float32).to(self.device)
+        self.t_mat = torch.tensor(mat[:, :3,3],dtype=torch.float32).to(self.device)
 
         # Setup pose and camera parameters
         self.r_c2w, self.t_c2w, self.exposure = torch.nn.ParameterList(), torch.nn.ParameterList(), torch.nn.ParameterList()
@@ -107,8 +122,9 @@ class LocalTensorfs(torch.nn.Module):
 
         if lr_i_init > 0:
             self.intrinsic_optimizer = torch.optim.Adam([self.focal_offset, self.center_rel], betas=(0.9, 0.99), lr=self.lr_i_init)
-
-
+        
+        self.proposal_estimators = torch.nn.ParameterList()
+        self.proposal_networks = torch.nn.ParameterList()
         # Setup radiance fields
         self.tensorfs = torch.nn.ParameterList()
         if self.args.use_dynamic:
@@ -116,6 +132,35 @@ class LocalTensorfs(torch.nn.Module):
         self.rf_iter = []
         self.world2rf = torch.nn.ParameterList()
         self.append_rf()
+
+        # emernerf loss
+        if self.cfg.data.pixel_source.load_rgb:
+            self.rgb_loss_fn = loss.RealValueLoss(
+                loss_type=self.cfg.supervision.rgb.loss_type,
+                coef=self.cfg.supervision.rgb.loss_coef,
+                name="rgb",
+                check_nan=self.cfg.optim.check_nan,
+            )
+        if self.cfg.nerf.model.head.enable_dynamic_branch:
+        ## ------ dynamic related losses -------- #
+            self.dynamic_reg_loss_fn = loss.DynamicRegularizationLoss(
+                loss_type=self.cfg.supervision.dynamic.loss_type,
+                coef=self.cfg.supervision.dynamic.loss_coef,
+                entropy_skewness=self.cfg.supervision.dynamic.entropy_loss_skewness,
+                check_nan=self.cfg.optim.check_nan,
+            )
+        else:
+            self.dynamic_reg_loss_fn = None
+
+        if self.cfg.nerf.model.head.enable_shadow_head:
+            self.shadow_loss_fn = loss.DynamicRegularizationLoss(
+                name="shadow",
+                loss_type=self.cfg.supervision.shadow.loss_type,
+                coef=self.cfg.supervision.shadow.loss_coef,
+                check_nan=self.cfg.optim.check_nan,
+            )
+        else:
+            self.shadow_loss_fn = None
 
     def append_rf(self, n_added_frames=1):
         self.is_refining = False
@@ -138,30 +183,68 @@ class LocalTensorfs(torch.nn.Module):
         else:
             world2rf = torch.zeros(3, device=self.device)
 
-        self.tensorfs.append(TensorVMSplit(device=self.device, **self.tensorf_args))
         if self.args.use_dynamic:
             self.tensorfs_dynamic.append(TensorVMSplit_TimeEmbedding(device=self.device, **self.tensorf_args))
-
+        
         self.world2rf.append(world2rf.clone().detach())
         
         self.rf_iter.append(0)
 
-        grad_vars = self.tensorfs[-1].get_optparam_groups(
-            self.rf_lr_init, self.rf_lr_basis
-        )
-        if self.args.use_dynamic:
-            grad_vars.extend(self.tensorfs_dynamic[-1].get_optparam_groups(self.rf_lr_init, self.rf_lr_basis))
-        self.rf_optimizer = (torch.optim.Adam(grad_vars, betas=(0.9, 0.99)))
+        if not self.args.use_emer:
+            self.tensorfs.append(TensorVMSplit(device=self.device, **self.tensorf_args))
+        
+        else:
+            # self.tensorfs.append(builders.build_model_from_cfg(cfg=self.cfg.nerf.model, dataset=self.dataset, device=self.device))
+            # tmp_estimator, tmp_network = builders.build_estimator_and_propnet_from_cfg(
+            #         nerf_cfg=self.cfg.nerf, optim_cfg=self.cfg.optim, dataset=self.dataset, device=self.device
+            #     )
+            import utils.misc as misc
+            model = builders.build_model_from_cfg(cfg=self.cfg.nerf.model, dataset=self.dataset, device=self.device)
+            tmp_estimator, tmp_network = builders.build_estimator_and_propnet_from_cfg(
+                    nerf_cfg=self.cfg.nerf, optim_cfg=self.cfg.optim, dataset=self.dataset, device=self.device
+                )
+            # start_step = misc.resume_from_checkpoint(
+            #     ckpt_path="/data/ljf/localrf/checkpoint_20000.pth",
+            #     model=model,
+            #     proposal_networks=tmp_network,
+            #     proposal_estimator=tmp_estimator,
+            #     optimizer=self.rf_optimizer,
+            #     scheduler=scheduler,
+            # )
+            self.proposal_requires_grad_fn = get_proposal_requires_grad_fn()
+            self.tensorfs.append(model)
+            self.rf_optimizer = builders.build_optimizer_from_cfg(cfg=self.cfg.optim, model=self.tensorfs[-1])
+            # ------ build scheduler -------- #
+            self.scheduler = builders.build_scheduler_from_cfg(cfg=self.cfg.optim, optimizer=self.rf_optimizer)
+            self.proposal_estimators.append(tmp_estimator)
+            self.proposal_networks.append(tmp_network)
+
+        if not self.args.use_emer:
+            grad_vars = self.tensorfs[-1].get_optparam_groups(
+                self.rf_lr_init, self.rf_lr_basis
+            )
+            if self.args.use_dynamic:
+                grad_vars.extend(self.tensorfs_dynamic[-1].get_optparam_groups(self.rf_lr_init, self.rf_lr_basis))
+            self.rf_optimizer = (torch.optim.Adam(grad_vars, betas=(0.9, 0.99)))
+            
 
     def append_frame(self):
         if len(self.r_c2w) == 0:
-            self.r_c2w.append(torch.eye(3, 2, device=self.device))
-            self.t_c2w.append(torch.zeros(3, device=self.device))
+            if self.args.use_vo_poses:
+                self.r_c2w.append(mtx_to_sixD(self.r_mat[0]))
+                self.t_c2w.append(self.t_mat[0])
+            else:
+                self.r_c2w.append(torch.eye(3, 2, device=self.device))
+                self.t_c2w.append(torch.zeros(3, device=self.device))
 
-            self.pose_linked_rf.append(0)            
+            self.pose_linked_rf.append(0)        
         else:
-            self.r_c2w.append(mtx_to_sixD(sixD_to_mtx(self.r_c2w[-1].clone().detach()[None]))[0])
-            self.t_c2w.append(self.t_c2w[-1].clone().detach())
+            if self.args.use_vo_poses:
+                self.r_c2w.append(mtx_to_sixD(self.r_mat[self.frame_index]))
+                self.t_c2w.append(self.t_mat[self.frame_index])
+            else:
+                self.r_c2w.append(mtx_to_sixD(sixD_to_mtx(self.r_c2w[-1].clone().detach()[None]))[0])
+                self.t_c2w.append(self.t_c2w[-1].clone().detach())
 
             self.blending_weights = torch.nn.Parameter(
                 torch.cat([self.blending_weights, self.blending_weights[-1:, :]], dim=0),
@@ -170,7 +253,8 @@ class LocalTensorfs(torch.nn.Module):
 
             rf_ind = int(torch.nonzero(self.blending_weights[-1, :])[0])
             self.pose_linked_rf.append(rf_ind)
-                
+        
+        self.frame_index += 1
         self.exposure.append(torch.eye(3, 3, device=self.device))
 
         if self.camera_prior is not None:
@@ -251,33 +335,35 @@ class LocalTensorfs(torch.nn.Module):
 
         # Optimize RFs
         self.rf_optimizer.step()
+        self.scheduler.step()
         if self.is_refining:
             for param_group in self.rf_optimizer.param_groups:
                 param_group["lr"] = param_group["lr"] * self.lr_factor
 
         # Increase RF resolution
-        if self.rf_iter[-1] in self.N_voxel_list:
-            n_voxels = self.N_voxel_list[self.rf_iter[-1]]
-            reso_cur = N_to_reso(n_voxels, self.tensorfs[-1].aabb)
-            self.tensorfs[-1].upsample_volume_grid(reso_cur)
-            if self.args.use_dynamic:
-                self.tensorfs_dynamic[-1].upsample_volume_grid(reso_cur)
-
-            if self.lr_upsample_reset:
-                print("reset lr to initial")
-                grad_vars = self.tensorfs[-1].get_optparam_groups(
-                    self.rf_lr_init, self.rf_lr_basis
-                )
+        if not self.args.use_emer:
+            if self.rf_iter[-1] in self.N_voxel_list:
+                n_voxels = self.N_voxel_list[self.rf_iter[-1]]
+                reso_cur = N_to_reso(n_voxels, self.tensorfs[-1].aabb)
+                self.tensorfs[-1].upsample_volume_grid(reso_cur)
                 if self.args.use_dynamic:
-                    grad_vars.extend(self.tensorfs_dynamic[-1].get_optparam_groups(self.lr_init, self.lr_basis))
-                self.rf_optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
+                    self.tensorfs_dynamic[-1].upsample_volume_grid(reso_cur)
 
-        # Update alpha mask
-        if self.rf_iter[-1] in self.update_AlphaMask_list:
-            reso_mask = (self.tensorfs[-1].gridSize / 2).int()
-            self.tensorfs[-1].updateAlphaMask(tuple(reso_mask))
-            if self.args.use_dynamic:
-                self.tensorfs_dynamic[-1].updateAlphaMask(tuple(reso_mask))
+                if self.lr_upsample_reset:
+                    print("reset lr to initial")
+                    grad_vars = self.tensorfs[-1].get_optparam_groups(
+                        self.rf_lr_init, self.rf_lr_basis
+                    )
+                    if self.args.use_dynamic:
+                        grad_vars.extend(self.tensorfs_dynamic[-1].get_optparam_groups(self.lr_init, self.lr_basis))
+                    self.rf_optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
+
+            # Update alpha mask
+            if self.rf_iter[-1] in self.update_AlphaMask_list:
+                reso_mask = (self.tensorfs[-1].gridSize / 2).int()
+                self.tensorfs[-1].updateAlphaMask(tuple(reso_mask))
+                if self.args.use_dynamic:
+                    self.tensorfs_dynamic[-1].updateAlphaMask(tuple(reso_mask))
 
         for idx in range(len(self.r_optimizers)):
             if self.pose_linked_rf[idx] == len(self.rf_iter) - 1 and self.rf_iter[-1] < self.n_iters:
@@ -333,7 +419,8 @@ class LocalTensorfs(torch.nn.Module):
             "update_AlphaMask_list": self.update_AlphaMask_per_frame_list,
             "lr_upsample_reset": self.lr_upsample_reset,
         }
-        kwargs.update(self.tensorfs[0].get_kwargs())
+        if not self.args.use_emer:
+            kwargs.update(self.tensorfs[0].get_kwargs())
         if self.args.use_dynamic:
             kwargs.update(self.tensorfs_dynamic[0].get_kwargs())    
 
@@ -973,20 +1060,26 @@ class LocalTensorfs(torch.nn.Module):
         chunk=16384,
         test_id=False,
         floater_thresh=0,
+        iteration=0,
     ):
+        i, j, curr_view = ids2pixel_view(W, H, ray_ids)
+        curr_view = curr_view.to(dtype=torch.int32)
         i, j = ids2pixel(W, H, ray_ids)
         if self.fov == 360:
             directions = get_ray_directions_360(i, j, W, H)
         else:
             directions = get_ray_directions_lean(i, j, self.focal(W), self.center(W, H))
 
+        
         if blending_weights is None:
             blending_weights = self.blending_weights[view_ids].clone()
         if cam2world is None:
             cam2world = self.get_cam2world(view_ids)
         if world2rf is None:
             world2rf = self.world2rf
-
+        
+        if self.args.enable_gt_poses:
+            origins, viewdirs, direction_norm_gt = get_rays(i, j, self.dataset.pixel_source.cam_to_worlds[curr_view], self.dataset.pixel_source.intrinsics[curr_view])
         # Train a single RF at a time
         if is_train:
             blending_weights[:, -1] = 1
@@ -1037,92 +1130,67 @@ class LocalTensorfs(torch.nn.Module):
             for rf_id in active_rf_ids:
                 blending_weight_chunk = blending_weights_chunk[:, rf_id]
                 cam2rf = cam2rfs[rf_id][chunk_idx * chunk : (chunk_idx + 1) * chunk]
-
+                # if self.args.use_emer:
+                #     rays_o, rays_d, direction_norm_gt = get_rays(i[chunk_idx * chunk : (chunk_idx + 1) * chunk], j[chunk_idx * chunk : (chunk_idx + 1) * chunk], cam2rf, self.dataset.pixel_source.intrinsics[curr_view[chunk_idx * chunk : (chunk_idx + 1) * chunk]])
+                # else:
                 rays_o, rays_d = get_rays_lean(directions_chunk, cam2rf)
                 rays = torch.cat([rays_o, rays_d], -1).view(-1, 6)
                 # 靠着这个学习pose
-                _, _, blending_s, pts_ref_s, weight_s, xyz_prime_s, rgb_s, sigma_s, z_vals_s, dists_s, rgb_map_t, depth_map_t = self.tensorfs[rf_id](
-                    rays,
-                    ts_chunk=None,
-                    is_train=is_train,
-                    white_bg=white_bg,
-                    N_samples=-1,
-                    refine=self.is_refining,
-                    floater_thresh=floater_thresh,
-                )
-                if self.args.use_dynamic:
-                    _, _, blending_d, pts_ref_d, weight_d, xyz_prime_d, rgb_d, sigma_d, z_vals_d, dists_d, _, _ = self.tensorfs_dynamic[rf_id](
-                        rays.detach(),
-                        ts_chunk=ts_chunk,
-                        timeembeddings_chunk=None,
+                if not self.args.use_emer:
+                    _, _, blending_s, pts_ref_s, weight_s, xyz_prime_s, rgb_s, sigma_s, z_vals_s, dists_s, rgb_map_t, depth_map_t = self.tensorfs[rf_id](
+                        rays,
+                        ts_chunk=None,
                         is_train=is_train,
                         white_bg=white_bg,
                         N_samples=-1,
                         refine=self.is_refining,
                         floater_thresh=floater_thresh,
                     )
-                    (
-                        rgb_map_full,
-                        depth_map_full,
-                        _,
-                        _,
-                        rgb_map_s,
-                        depth_map_s,
-                        _,
-                        weights_s,
-                        rgb_map_d,
-                        depth_map_d,
-                        _,
-                        weights_d,
-                        dynamicness_map,
-                    )= raw2outputs(rgb_s, sigma_s, rgb_d, sigma_d, dists_d, blending_d, z_vals_d, rays, is_train=True, ray_type="contract")
-                # rgb_map_s和rgb_map_t是否一致
-                if self.args.use_dynamic:
-                    rgbs_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        rgbs_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        rgb_map_s * blending_weight_chunk[..., None]
-                    )
-                    depth_maps_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        depth_maps_static[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        depth_map_s * blending_weight_chunk
-                    )
-                    rgbs_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        rgbs_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        rgb_map_d * blending_weight_chunk[..., None]
-                    )
-                    depth_maps_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        depth_maps_dynamic[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        depth_map_d * blending_weight_chunk
-                    )
-                    rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        rgb_map_full * blending_weight_chunk[..., None]
-                    )
-                    depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        depth_map_full * blending_weight_chunk
-                    )
-                    # mask
-                    mask[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        mask[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        dynamicness_map * blending_weight_chunk
-                    )
                 else:
-                    rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        rgb_map_t * blending_weight_chunk[..., None]
+                    proposal_requires_grad = self.proposal_requires_grad_fn(int(iteration))
+                    
+                    if self.args.enable_gt_poses:
+                        # pixel_data_dict = {"origins": origins[chunk_idx * chunk : (chunk_idx + 1) * chunk], "viewdirs": viewdirs[chunk_idx * chunk : (chunk_idx + 1) * chunk], "direction_norm": direction_norm_gt[chunk_idx * chunk : (chunk_idx + 1) * chunk], "normed_timestamps": self.dataset.pixel_source.unique_normalized_timestamps[curr_view][:rays_o.shape[0]], "pixel_coords": torch.stack([j / H, i / W], dim=-1)}
+                        self.dataset.train_pixel_set.update_train_frames(view_ids.unique())
+                        i = torch.randint(0, len(self.dataset.train_pixel_set), (1,)).item()
+                        pixel_data_dict = self.dataset.train_pixel_set[i]
+
+                    else:
+                        direction_norm = torch.linalg.norm(rays_d, dim=-1, keepdims=True)
+                        pixel_data_dict = {"origins": rays_o, "viewdirs": rays_d, "direction_norm": direction_norm, "normed_timestamps": self.dataset.pixel_source.unique_normalized_timestamps[curr_view][:rays_o.shape[0]], "pixel_coords": torch.stack([j / H, i / W], dim=-1)}
+                        
+                    # ------ pixel-wise supervision -------- #
+                    render_results = render_rays(
+                        radiance_field=self.tensorfs[rf_id],
+                        proposal_estimator=self.proposal_estimators[rf_id],
+                        proposal_networks=self.proposal_networks[rf_id],
+                        data_dict=pixel_data_dict,
+                        cfg=self.cfg,
+                        proposal_requires_grad=proposal_requires_grad,
                     )
-                    depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
-                        depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                        depth_map_t * blending_weight_chunk
+                    rgb_map_t, depth_map_t = render_results["rgb"], render_results["depth"].squeeze(-1)
+                    self.proposal_estimators[rf_id].update_every_n_steps(
+                        render_results["extras"]["trans"],
+                        proposal_requires_grad,
+                        loss_scaler=1024,
                     )
 
+                rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                    rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                    rgb_map_t * blending_weight_chunk[..., None]
+                )
+                depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                    depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
+                    depth_map_t * blending_weight_chunk
+                )
+        
         for rf_id, initial_device in zip(active_rf_ids, initial_devices):
             if initial_device != view_ids.device:
                 self.tensorfs[rf_id].to(initial_device)
                 torch.cuda.empty_cache()
 
         if self.lr_exposure_init > 0:
+        # if False:
             # TODO: cleanup
             if test_id:
                 view_ids_m = torch.maximum(view_ids - 1, torch.tensor(0, device=view_ids.device))
@@ -1147,5 +1215,75 @@ class LocalTensorfs(torch.nn.Module):
                 rgbs_dynamic=None
                 rgbs_static=None
         rgbs = rgbs.clamp(0, 1)
+        if self.args.use_emer and self.args.enable_gt_poses:
+            if N_rays_all>10000:
+                render_results = render_pixels(
+                    cfg=self.cfg,
+                    model=self.tensorfs[-1],
+                    proposal_estimator=self.proposal_estimators[-1],
+                    dataset=self.dataset.full_pixel_set,
+                    proposal_networks=self.proposal_networks[-1],
+                    compute_metrics=True,
+                    return_decomposition=True,
+                    vis_indices=view_ids.unique(),
+                )
+                eval_dict = {}
+                for k, v in render_results.items():
+                    if k in [
+                        "psnr",
+                        "ssim",
+                        "feat_psnr",
+                        "masked_psnr",
+                        "masked_ssim",
+                        "masked_feat_psnr",
+                    ]:
+                        eval_dict[f"pixel_metrics/test/{k}"] = v
+                print(f"test_psnr: {render_results['psnr']}\n")
+                
+        if self.args.use_emer:
+            return rgbs, depth_maps, rgbs_static, depth_maps_static, rgbs_dynamic, depth_maps_dynamic, mask, directions, ij, pixel_data_dict, render_results
+        else:
+            return rgbs, depth_maps, rgbs_static, depth_maps_static, rgbs_dynamic, depth_maps_dynamic, mask, directions, ij, None, None
 
-        return rgbs, depth_maps, rgbs_static, depth_maps_static, rgbs_dynamic, depth_maps_dynamic, mask, directions, ij
+from torch import Tensor
+from typing import Dict, Tuple, Union, List
+
+def get_rays(
+    x: Tensor, y: Tensor, c2w: Tensor, intrinsic: Tensor
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    Args:
+        x: the horizontal coordinates of the pixels, shape: (num_rays,)
+        y: the vertical coordinates of the pixels, shape: (num_rays,)
+        c2w: the camera-to-world matrices, shape: (num_cams, 4, 4)
+        intrinsic: the camera intrinsic matrices, shape: (num_cams, 3, 3)
+    Returns:
+        origins: the ray origins, shape: (num_rays, 3)
+        viewdirs: the ray directions, shape: (num_rays, 3)
+        direction_norm: the norm of the ray directions, shape: (num_rays, 1)
+    """
+
+    if len(intrinsic.shape) == 2:
+        intrinsic = intrinsic[None, :, :]
+    if len(c2w.shape) == 2:
+        c2w = c2w[None, :, :]
+    camera_dirs = torch.nn.functional.pad(
+        torch.stack(
+            [
+                (x - intrinsic[:, 0, 2] + 0.5) / intrinsic[:, 0, 0],
+                (y - intrinsic[:, 1, 2] + 0.5) / intrinsic[:, 1, 1],
+            ],
+            dim=-1,
+        ),
+        (0, 1),
+        value=1.0,
+    )  # [num_rays, 3]
+
+    # rotate the camera rays w.r.t. the camera pose
+    directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
+    origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)
+    # TODO: not sure if we still need direction_norm
+    direction_norm = torch.linalg.norm(directions, dim=-1, keepdims=True)
+    # normalize the ray directions
+    viewdirs = directions / (direction_norm + 1e-8)
+    return origins, viewdirs, direction_norm

@@ -2,7 +2,7 @@
 # Copyright (c) 2022 Anpei Chen
 
 import configargparse
-
+import argparse
 def config_parser(cmd=None):
     parser = configargparse.ArgumentParser()
     parser.add_argument("--config", is_config_file=True, help="config file path")
@@ -196,8 +196,17 @@ def config_parser(cmd=None):
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use_dynamic", type=int, default=0, help="whether use time t")
-    parser.add_argument("--warmup", type=int, default=1, help="whether warmup")
+    parser.add_argument("--enable_gt_poses", type=int, default=1, help="waymo poses gt debug add emer")
+    parser.add_argument("--use_emer", type=int, default=0, help="whether use emer")
+    parser.add_argument("--use_vo_poses", type=int, default=0, help="whether use vo poses init")
 
+    parser.add_argument("--config_file", type=str, default="configs/default_flow.yaml")
+    parser.add_argument(
+        "opts",
+        help="Modify config options using the command-line",
+        default=None,
+        nargs=argparse.REMAINDER,
+    )
     if cmd is not None:
         return parser.parse_args(cmd)
     else:

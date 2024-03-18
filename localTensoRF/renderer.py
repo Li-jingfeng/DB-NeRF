@@ -32,12 +32,19 @@ def render(
     start=0,
     floater_thresh=0,
     add_frame_to_list=True, # Set False to save RAM. Set True for Tensorboard.
+    dataset=None,
 ):
     rgb_maps_tb, depth_maps_tb, gt_rgbs_tb, poses_vis = [], [], [], []
     fwd_flow_cmp_tb, bwd_flow_cmp_tb, depth_cmp_tb = [], [], []
-
+    if args.use_emer:
+        local_tensorfs.tensorfs[-1].eval()
+        local_tensorfs.proposal_estimators[-1].eval()
+        for p in local_tensorfs.proposal_networks[-1]:
+            p.eval()
+    local_tensorfs.eval()
     if test:
         idxs = [train_dataset.all_fbases[fbase] for fbase in test_dataset.all_fbases]
+        # idxs.append(1)# 添加训练集的图像 1
         idxs = [idx for idx in idxs if start <= idx < poses_mtx.shape[0]]
     else:
         poses_mtx = poses_mtx[start:]
@@ -63,7 +70,7 @@ def render(
         else:
             view_ids = frame_indices[idx][None]
         # rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij
-        rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij = local_tensorfs(
+        rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij, _, _ = local_tensorfs(
             rays_ids,
             view_ids,
             W,
@@ -78,46 +85,47 @@ def render(
             ts=rays_ts,
         )              
         
-        if test and add_frame_to_list:
+        if not args.enable_gt_poses and test and add_frame_to_list:
             fbase = train_dataset.get_frame_fbase(idx)
             # Flow render
-            if test_dataset.all_fwd_flow is not None:
-                view_ids = torch.Tensor([idx]).to(depth_map).long()
-                cam2world = local_tensorfs.get_cam2world()
-                fwd_cam2cams, bwd_cam2cams = get_fwd_bwd_cam2cams(cam2world, view_ids)
-                pts = directions[None] * depth_map[None, ..., None]
-                center = local_tensorfs.center(W, H)
-                pred_fwd_flow = get_pred_flow(pts, ij, fwd_cam2cams, local_tensorfs.focal(W), center).cpu().numpy()
-                pred_bwd_flow = get_pred_flow(pts, ij, bwd_cam2cams, local_tensorfs.focal(W), center).cpu().numpy()
-                pred_fwd_flow, pred_bwd_flow = pred_fwd_flow.reshape(H, W, 2), pred_bwd_flow.reshape(H, W, 2)
-                fwd_flow = cv2.resize(test_dataset.all_fwd_flow[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST) 
-                fwd_mask = cv2.resize(test_dataset.all_fwd_mask[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)
-                bwd_flow = cv2.resize(test_dataset.all_bwd_flow[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)
-                bwd_mask = cv2.resize(test_dataset.all_bwd_mask[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)
-                fwd_flow_cmp0 = np.vstack([pred_fwd_flow[..., 0], fwd_flow[..., 0]])
-                fwd_flow_cmp0 /= np.quantile(fwd_flow_cmp0, 0.9)
-                fwd_flow_err0 = np.abs(pred_fwd_flow[..., 0] - fwd_flow[..., 0]) * fwd_mask / W
-                fwd_flow_cmp0 = np.vstack([fwd_flow_cmp0, fwd_flow_err0])
-                fwd_flow_cmp1 = np.vstack([pred_fwd_flow[..., 1], fwd_flow[..., 1]])
-                fwd_flow_cmp1 /= np.quantile(fwd_flow_cmp1, 0.9)
-                fwd_flow_err1 = np.abs(pred_fwd_flow[..., 1] - fwd_flow[..., 1]) * fwd_mask / W
-                fwd_flow_cmp1 = np.vstack([fwd_flow_cmp1, fwd_flow_err1])
-                fwd_flow_cmp = np.hstack([fwd_flow_cmp0, fwd_flow_cmp1])
+            # if False:
+            view_ids = torch.Tensor([idx]).to(depth_map).long()
+            cam2world = local_tensorfs.get_cam2world()
+            fwd_cam2cams, bwd_cam2cams = get_fwd_bwd_cam2cams(cam2world, view_ids)
+            pts = directions[None] * depth_map[None, ..., None]
+            center = local_tensorfs.center(W, H)
+            pred_fwd_flow = get_pred_flow(pts, ij, fwd_cam2cams, local_tensorfs.focal(W), center).cpu().numpy()
+            pred_bwd_flow = get_pred_flow(pts, ij, bwd_cam2cams, local_tensorfs.focal(W), center).cpu().numpy()
+            pred_fwd_flow, pred_bwd_flow = pred_fwd_flow.reshape(H, W, 2), pred_bwd_flow.reshape(H, W, 2)
+            fwd_flow = cv2.resize(test_dataset.all_fwd_flow[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST) 
+            fwd_mask = cv2.resize(test_dataset.all_fwd_mask[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)
+            bwd_flow = cv2.resize(test_dataset.all_bwd_flow[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)
+            bwd_mask = cv2.resize(test_dataset.all_bwd_mask[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)
+            fwd_flow_cmp0 = np.vstack([pred_fwd_flow[..., 0], fwd_flow[..., 0]])
+            fwd_flow_cmp0 /= np.quantile(fwd_flow_cmp0, 0.9)
+            fwd_flow_err0 = np.abs(pred_fwd_flow[..., 0] - fwd_flow[..., 0]) * fwd_mask / W
+            fwd_flow_cmp0 = np.vstack([fwd_flow_cmp0, fwd_flow_err0])
+            fwd_flow_cmp1 = np.vstack([pred_fwd_flow[..., 1], fwd_flow[..., 1]])
+            fwd_flow_cmp1 /= np.quantile(fwd_flow_cmp1, 0.9)
+            fwd_flow_err1 = np.abs(pred_fwd_flow[..., 1] - fwd_flow[..., 1]) * fwd_mask / W
+            fwd_flow_cmp1 = np.vstack([fwd_flow_cmp1, fwd_flow_err1])
+            fwd_flow_cmp = np.hstack([fwd_flow_cmp0, fwd_flow_cmp1])
 
-                bwd_flow_cmp0 = np.vstack([pred_bwd_flow[..., 0], bwd_flow[..., 0]])
-                bwd_flow_cmp0 /= np.quantile(bwd_flow_cmp0, 0.9)
-                bwd_flow_err0 = np.abs(pred_bwd_flow[..., 0] - bwd_flow[..., 0]) * bwd_mask / W
-                bwd_flow_cmp0 = np.vstack([bwd_flow_cmp0, bwd_flow_err0])
-                bwd_flow_cmp1 = np.vstack([pred_bwd_flow[..., 1], bwd_flow[..., 1]])
-                bwd_flow_cmp1 /= np.quantile(bwd_flow_cmp1, 0.9)
-                bwd_flow_err1 = np.abs(pred_bwd_flow[..., 1] - bwd_flow[..., 1]) * bwd_mask / W
-                bwd_flow_cmp1 = np.vstack([bwd_flow_cmp1, bwd_flow_err1])
-                bwd_flow_cmp = np.hstack([bwd_flow_cmp0, bwd_flow_cmp1])
-                fwd_flow_cmp_tb.append(torch.from_numpy(fwd_flow_cmp).clamp(0, 1)) # Only need this one for TensorBoard
-                bwd_flow_cmp_tb.append(torch.from_numpy(bwd_flow_cmp).clamp(0, 1)) # Only need this one for TensorBoard
+            bwd_flow_cmp0 = np.vstack([pred_bwd_flow[..., 0], bwd_flow[..., 0]])
+            bwd_flow_cmp0 /= np.quantile(bwd_flow_cmp0, 0.9)
+            bwd_flow_err0 = np.abs(pred_bwd_flow[..., 0] - bwd_flow[..., 0]) * bwd_mask / W
+            bwd_flow_cmp0 = np.vstack([bwd_flow_cmp0, bwd_flow_err0])
+            bwd_flow_cmp1 = np.vstack([pred_bwd_flow[..., 1], bwd_flow[..., 1]])
+            bwd_flow_cmp1 /= np.quantile(bwd_flow_cmp1, 0.9)
+            bwd_flow_err1 = np.abs(pred_bwd_flow[..., 1] - bwd_flow[..., 1]) * bwd_mask / W
+            bwd_flow_cmp1 = np.vstack([bwd_flow_cmp1, bwd_flow_err1])
+            bwd_flow_cmp = np.hstack([bwd_flow_cmp0, bwd_flow_cmp1])
+            fwd_flow_cmp_tb.append(torch.from_numpy(fwd_flow_cmp).clamp(0, 1)) # Only need this one for TensorBoard
+            bwd_flow_cmp_tb.append(torch.from_numpy(bwd_flow_cmp).clamp(0, 1)) # Only need this one for TensorBoard
 
             # Depth error
             if test_dataset.all_invdepths is not None:
+            # if False:
                 invdepths = torch.from_numpy(cv2.resize(test_dataset.all_invdepths[test_dataset.all_fbases[fbase]], (W, H), interpolation=cv2.INTER_NEAREST)).to(args.device)
                 invdepths = invdepths.view(1, -1)
                 dyn_depth_norm, gt_depth_norm, depth_loss_arr = compute_depth_loss(1 / depth_map[None].clamp(1e-6), invdepths)
@@ -173,13 +181,13 @@ def render(
             gt_rgb = torch.from_numpy(gt_rgb)
             if add_frame_to_list:
                 gt_rgbs_tb.append(torch.Tensor(gt_rgb))  # HWC
-
             mse = ((gt_rgb - rgb_map) ** 2).mean()
             ssim = rgb_ssim(gt_rgb.numpy(), rgb_map.numpy(), 1)
             metrics[fbase] = {
                 "mse": mse,
                 "ssim": ssim,
             }
+
 
         if save_frames and savePath is not None:
             if not test:

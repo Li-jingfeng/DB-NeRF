@@ -326,7 +326,7 @@ def convert_sdf_samples_to_ply(
 ):
     """
     Convert sdf samples to .ply
-
+    
     :param pytorch_3d_sdf_tensor: a torch.FloatTensor of shape (n,n,n)
     :voxel_grid_origin: a list of three floats: the bottom, left, down origin of the voxel grid
     :voxel_size: float, the size of the voxels

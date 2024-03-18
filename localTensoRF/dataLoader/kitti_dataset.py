@@ -71,8 +71,8 @@ class LocalRFDataset(Dataset):
             self.rel_poses = self.rel_poses[::frame_step]
 
         else:
-            self.image_paths = sorted(os.listdir(os.path.join(self.root_dir, "images")))
-        self.image_paths = [f for f in self.image_paths if f.split("_")[-1]=="0.jpg"]
+            self.image_paths = sorted(os.listdir(os.path.join(self.root_dir, "image_2")))
+        # self.image_paths = [f for f in self.image_paths if f.split("_")[-1]=="0.jpg"]
         
         if subsequence != [0, -1]:
             self.image_paths = self.image_paths[subsequence[0]:subsequence[1]]
@@ -102,6 +102,7 @@ class LocalRFDataset(Dataset):
 
         self.near_far = [0.1, 1e3] # Dummi
         self.scene_bbox = 2 * torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+        # self.scene_bbox = 2 * torch.tensor([[-20, -20, -20], [20, 20, 20]])
         
         self.all_ts = None
         self.all_masks = None
@@ -147,7 +148,7 @@ class LocalRFDataset(Dataset):
 
     def read_meta(self):
         def read_image(i):
-            image_path = os.path.join(self.root_dir, "images", self.image_paths[i])
+            image_path = os.path.join(self.root_dir, "image_2", self.image_paths[i])
             motion_mask_path = os.path.join(self.root_dir, "dynamic_masks", 
                 f"{os.path.splitext(self.image_paths[i])[0]}.png")
             if not os.path.isfile(motion_mask_path):
@@ -257,7 +258,7 @@ class LocalRFDataset(Dataset):
                 self.all_bwd_flow = np.stack(all_bwd_flow, 0)
                 self.all_bwd_mask = np.stack(all_bwd_mask, 0)
         else:
-            self.all_masks = concatenate_append(self.all_masks, all_mask, 1)
+            # self.all_masks = concatenate_append(self.all_masks, all_mask, 1)
             self.all_ts = concatenate_append(self.all_ts, all_ts, 1)
             self.all_rgbs = concatenate_append(self.all_rgbs, all_rgbs, 3)
             if self.load_depth:
@@ -315,7 +316,7 @@ class LocalRFDataset(Dataset):
         idx_sample = idx - self.active_frames_bounds[0] * self.n_px_per_frame
 
         return {
-            "mask": self.all_masks[idx_sample],
+            # "mask": self.all_masks[idx_sample],
             "ts": self.all_ts[idx_sample],
             "rgbs": self.all_rgbs[idx_sample], 
             "loss_weights": self.all_loss_weights[idx_sample], 

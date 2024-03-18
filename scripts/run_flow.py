@@ -63,7 +63,7 @@ if __name__ == '__main__':
 
     # Read and preprocess the video
     input_files = sorted(os.listdir(f"{args.data_dir}/images"))
-    input_files = [f for f in input_files if f.split('_')[-1]=="0.jpg"] # only keep the first cam of each sequence
+    # input_files = [f for f in input_files if f.split('_')[-1]=="0.jpg"] # only keep the first cam of each sequence
     input_files = input_files[::args.frame_step]
     os.makedirs(f"{args.data_dir}/flow_ds", exist_ok=True)
     os.makedirs(f"{args.data_dir}/flow_vis", exist_ok=True)

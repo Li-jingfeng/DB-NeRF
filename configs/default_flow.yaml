@@ -1,0 +1,66 @@
+
+nerf:
+  model:
+    head:
+      enable_dynamic_branch: False # whether to use dynamic branch
+      enable_shadow_head: False # whether to use shadow head
+      enable_flow_branch: False  # whether to use flow branch
+eval:
+  eval_lidar_flow: False # whether to evaluate lidar flow, only available for waymo for now
+  remove_ground_when_eval_lidar_flow: False # whether to remove ground points when evaluating lidar flow
+
+#------------------Ours changed params----------------------
+# out of memory
+data:
+  ray_batch_size: 4096
+  num_frame_per_nerf: 20 # 每个nerf有多少个frames
+# 只保留一个相机，因为目前需要学习pose，暂时完成的代码仅仅当相机数量=1时可以正常运行
+  pixel_source:
+    num_cams: 1
+    load_size: [640, 960] # kitti的话是[320,960]
+    use_dynamo_poses: False # 新的实验，使用dynamo pred pose看看效果, (如果想要恢复，只需要这里改成false)
+    load_disp: False # 加载DPT预测出的disp(1/depth)
+    # 划分train/test
+    test_image_stride: 10 # 需要与num_frame_per_nerf保持一致
+    test_image_start_id: 10
+    eval_epoch: 1000
+  lidar_source: 
+    load_lidar: False # 给不给lidar监督
+supervision:
+  depth:
+    enable: False # 不加载lidar，同时这里为true意味着要单目深度监督
+# # 使用真值
+pose:
+  learn_poses: False
+  learn_R: False
+  learn_t: False
+  use_gt_poses: True
+  pose_lr: 0.0005
+  load_ckpt_model_only: False # 这个参数暂时不清楚有什么作用
+  load_poses_dir: /data/yly/EmerNeRF/out/emernerf_poses_free  #举个例子
+
+  learn_distortion: False
+  load_distortion_dir: /data/yly/EmerNeRF/out/emernerf_poses_free
+  distortion_lr: 0.0005
+
+# 学习pose
+# pose:
+#   learn_poses: True
+#   learn_R: True
+#   learn_t: True  # 加载vo的pose，不学习translation，只学习rotation
+#   use_gt_poses: False
+#   pose_lr: 0.0005
+#   load_ckpt_model_only: False # 这个参数暂时不清楚有什么作用
+#   load_poses_dir: /data/yly/EmerNeRF/out/emernerf_poses_free  #举个例子
+
+#   learn_distortion: False
+#   load_distortion_dir: /data/yly/EmerNeRF/out/emernerf_poses_free
+#   distortion_lr: 0.0005
+# 仅仅是为了debug 用完删掉
+# logging:
+#   vis_freq: 1
+# optim:
+#   cache_rgb_freq: 1
+
+# 为了给李昊出query_view的测试结果
+# resume_from: /data/yly/EmerNeRF/out/emernerf_poses_free/016_pose_free/checkpoint_100000.pth

@@ -13,11 +13,12 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 import json
 import sys
 import time
-
+from add_func import compute_psnr
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append("localTensoRF")
 from dataLoader.localrf_dataset import LocalRFDataset
+# from dataLoader.kitti_dataset import LocalRFDataset
 from local_tensorfs import LocalTensorfs
 from opt import config_parser
 from renderer import render
@@ -202,6 +203,20 @@ def render_test(args):
         train_dataset=train_dataset
     )
 
+from omegaconf import OmegaConf
+def setup(args):
+    # ------ get config from args -------- #
+    default_config = OmegaConf.create(OmegaConf.load("configs/default_config.yaml"))
+    cfg = OmegaConf.load(args.config_file)
+    # cfg = OmegaConf.merge(default_config, cfg)
+    cfg = OmegaConf.merge(default_config, cfg, OmegaConf.from_cli(args.opts))
+    # log_dir = os.path.join(args.output_root, args.run_name)
+    # cfg.log_dir = log_dir
+    cfg.nerf.model.num_cams = cfg.data.pixel_source.num_cams
+    cfg.nerf.model.unbounded = cfg.nerf.unbounded
+    cfg.nerf.propnet.unbounded = cfg.nerf.unbounded
+    cfg.nerf.model.resume_from = cfg.resume_from
+    return cfg
 
 def reconstruction(args):
     # Apply speedup factors
@@ -219,6 +234,9 @@ def reconstruction(args):
     args.TV_weight_density = args.TV_weight_density * args.prog_speedup_factor
     args.TV_weight_app = args.TV_weight_app * args.prog_speedup_factor
     
+    # waymo dataset
+    from dataLoader.waymo import WaymoDataset
+    waymodataset = WaymoDataset(data_cfg=cfg.data, cfg_pose=cfg.pose)
     # init dataset
     train_dataset = LocalRFDataset(
         f"{args.datadir}",
@@ -243,6 +261,7 @@ def reconstruction(args):
         subsequence=args.subsequence,
         frame_step=args.frame_step,
     )
+
     near_far = train_dataset.near_far
 
     # init resolution
@@ -333,6 +352,8 @@ def reconstruction(args):
         featureC=args.featureC,
         step_ratio=args.step_ratio,
         fea2denseAct=args.fea2denseAct,
+        cfg=cfg,
+        dataset=waymodataset,
     )
     local_tensorfs = local_tensorfs.to(args.device)
 
@@ -354,14 +375,7 @@ def reconstruction(args):
     iteration = 0
     metrics = {}
     start_time = time.time()
-    if args.warmup:
-        args.use_dynamic = 0 # 首先禁止dynamic
     while training:
-        if args.warmup and iteration == 1000:
-            print("Start using dynamic mask")
-            args.use_dynamic = 1
-            train_dataset.active_frames_bounds[0], train_dataset.active_frames_bounds[1] = 0, train_dataset.n_init_frames
-
         optimize_poses = args.lr_R_init > 0 or args.lr_t_init > 0
         data_blob = train_dataset.sample(args.batch_size, local_tensorfs.is_refining, optimize_poses)
         view_ids = torch.from_numpy(data_blob["view_ids"]).to(args.device)
@@ -370,10 +384,11 @@ def reconstruction(args):
         train_test_poses = data_blob["train_test_poses"]
         ray_idx = torch.from_numpy(data_blob["idx"]).to(args.device)
         rays_ts = torch.from_numpy(data_blob["ts"]).squeeze(1).to(args.device)
-        dynamic_mask = torch.from_numpy(data_blob["mask"]).squeeze(1).to(args.device)
+        # dynamic_mask = torch.from_numpy(data_blob["mask"]).squeeze(1).to(args.device)
         reg_loss_weight = local_tensorfs.lr_factor ** (local_tensorfs.rf_iter[-1])
-        
-        rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij = local_tensorfs(
+        if args.use_emer:
+            local_tensorfs.train()
+        rgb_map, depth_map, rgb_static, depth_map_static, rgb_dynamic, depth_map_dynamic, pred_mask, directions, ij, pixel_data_dict, render_results = local_tensorfs(
             ray_idx,
             view_ids,
             W,
@@ -381,104 +396,130 @@ def reconstruction(args):
             is_train=True,
             test_id=train_test_poses,
             ts=rays_ts,
+            iteration=iteration,
         )
-
         # loss
-        loss = (0.25 * ((torch.abs(rgb_map - rgb_train)) * loss_weights) / loss_weights.mean()).mean()
-        # mask
-        if args.use_dynamic:
-            # rgb static & dynamic loss
-            valid_s = dynamic_mask < 0.5
-            valid_d = torch.logical_not(valid_s)
-            loss += (0.25 * ((torch.abs(rgb_static[valid_s] - rgb_train[valid_s])) * loss_weights[valid_s]) / loss_weights[valid_s].mean()).mean()
-            loss += (0.25 * ((torch.abs(rgb_dynamic[valid_d] - rgb_train[valid_d])) * loss_weights[valid_d]) / loss_weights[valid_d].mean()).mean()
-
-            depth_map_static = depth_map_static.view(view_ids.shape[0], -1)
-            loss_weights = loss_weights.view(view_ids.shape[0], -1)
-            depth_map_static = depth_map_static.view(view_ids.shape[0], -1)
-
-            depth_map_dynamic = depth_map_dynamic.view(view_ids.shape[0], -1)
-            loss_weights = loss_weights.view(view_ids.shape[0], -1)
-            depth_map_dynamic = depth_map_dynamic.view(view_ids.shape[0], -1)
+        if not args.enable_gt_poses:
+            # loss = (0.25 * ((torch.abs(rgb_map - rgb_train)) * loss_weights) / loss_weights.mean()).mean()
+            tmp = local_tensorfs.rgb_loss_fn(rgb_map, rgb_train)
+            loss = tmp['rgb_loss_l2']
+            if args.use_emer and local_tensorfs.dynamic_reg_loss_fn is not None:
+                tmp = local_tensorfs.dynamic_reg_loss_fn(dynamic_density=render_results["extras"]["dynamic_density"],
+                        static_density=render_results["extras"]["static_density"],
+                    )
+                loss += tmp['dynamic_sparsity_loss']
+            if args.use_emer and local_tensorfs.shadow_loss_fn is not None:
+                tmp = local_tensorfs.shadow_loss_fn(
+                            render_results["shadow_ratio"],
+                        )
+                loss += tmp['shadow_sparsity_loss']
+        else:
+            loss = (((torch.abs(rgb_map - pixel_data_dict['pixels'])) * loss_weights) / loss_weights.mean()).mean()
+            if args.use_emer and local_tensorfs.dynamic_reg_loss_fn is not None:
+                tmp = local_tensorfs.dynamic_reg_loss_fn(dynamic_density=render_results["extras"]["dynamic_density"],
+                        static_density=render_results["extras"]["static_density"],
+                    )
+                loss += tmp['dynamic_sparsity_loss']
+            if args.use_emer and local_tensorfs.shadow_loss_fn is not None:
+                tmp = local_tensorfs.shadow_loss_fn(
+                            render_results["shadow_ratio"],
+                        )
+                loss += tmp['shadow_sparsity_loss']
+        # loss = (1.0 * ((torch.abs(rgb_map - pixel_data_dict["pixels"])) * loss_weights) / loss_weights.mean()).mean()
+        # print(f"train_loss: {loss}\n")
         # loss = loss.mean()
         total_loss = loss
         writer.add_scalar("train/rgb_loss", loss, global_step=iteration)
-
+        if not args.enable_gt_poses:
+            psnr = compute_psnr(
+                    rgb_map, rgb_train
+                )
+        else:
+            psnr = compute_psnr(
+                    rgb_map, pixel_data_dict["pixels"]
+                )
+        writer.add_scalar("train/train_psnr", psnr, global_step=iteration)
         ## Regularization
         # Get rendered rays schedule
-        if local_tensorfs.regularize and args.loss_flow_weight_inital > 0 or args.loss_depth_weight_inital > 0:
-            depth_map = depth_map.view(view_ids.shape[0], -1)
-            loss_weights = loss_weights.view(view_ids.shape[0], -1)
-            depth_map = depth_map.view(view_ids.shape[0], -1)
-            writer.add_scalar("train/reg_loss_weights", reg_loss_weight, global_step=iteration)
+        if not args.enable_gt_poses:
+            if local_tensorfs.regularize and args.loss_flow_weight_inital > 0 or args.loss_depth_weight_inital > 0:
+            # if False:
+                depth_map = depth_map.view(view_ids.shape[0], -1)
+                loss_weights = loss_weights.view(view_ids.shape[0], -1)
+                depth_map = depth_map.view(view_ids.shape[0], -1)
+                writer.add_scalar("train/reg_loss_weights", reg_loss_weight, global_step=iteration)
 
         # Optical flow
-        if local_tensorfs.regularize and args.loss_flow_weight_inital > 0:
-            if args.fov == 360:
-                raise NotImplementedError
-            starting_frame_id = max(train_dataset.active_frames_bounds[0] - 1, 0)
-            cam2world = local_tensorfs.get_cam2world(starting_id=starting_frame_id)
-            directions = directions.view(view_ids.shape[0], -1, 3)
-            ij = ij.view(view_ids.shape[0], -1, 2)
-            fwd_flow = torch.from_numpy(data_blob["fwd_flow"]).to(args.device).view(view_ids.shape[0], -1, 2)
-            fwd_mask = torch.from_numpy(data_blob["fwd_mask"]).to(args.device).view(view_ids.shape[0], -1)
-            fwd_mask[view_ids == len(cam2world) - 1] = 0
-            bwd_flow = torch.from_numpy(data_blob["bwd_flow"]).to(args.device).view(view_ids.shape[0], -1, 2)
-            bwd_mask = torch.from_numpy(data_blob["bwd_mask"]).to(args.device).view(view_ids.shape[0], -1)
-            fwd_cam2cams, bwd_cam2cams = get_fwd_bwd_cam2cams(cam2world, view_ids - starting_frame_id)
-                       
-            pts = directions * depth_map[..., None]
-            pred_fwd_flow = get_pred_flow(
-                pts, ij, fwd_cam2cams, local_tensorfs.focal(W), local_tensorfs.center(W, H))
-            pred_bwd_flow = get_pred_flow(
-                pts, ij, bwd_cam2cams, local_tensorfs.focal(W), local_tensorfs.center(W, H))
-            flow_loss_arr =  torch.sum(torch.abs(pred_bwd_flow - bwd_flow), dim=-1) * bwd_mask
-            flow_loss_arr += torch.sum(torch.abs(pred_fwd_flow - fwd_flow), dim=-1) * fwd_mask
-            flow_loss_arr[flow_loss_arr > torch.quantile(flow_loss_arr, 0.9, dim=1)[..., None]] = 0
+        if not args.enable_gt_poses:
+            if local_tensorfs.regularize and args.loss_flow_weight_inital > 0:
+            # if False:
+                if args.fov == 360:
+                    raise NotImplementedError
+                starting_frame_id = max(train_dataset.active_frames_bounds[0] - 1, 0)
+                cam2world = local_tensorfs.get_cam2world(starting_id=starting_frame_id)
+                directions = directions.view(view_ids.shape[0], -1, 3)
+                ij = ij.view(view_ids.shape[0], -1, 2)
+                fwd_flow = torch.from_numpy(data_blob["fwd_flow"]).to(args.device).view(view_ids.shape[0], -1, 2)
+                fwd_mask = torch.from_numpy(data_blob["fwd_mask"]).to(args.device).view(view_ids.shape[0], -1)
+                fwd_mask[view_ids == len(cam2world) - 1] = 0
+                bwd_flow = torch.from_numpy(data_blob["bwd_flow"]).to(args.device).view(view_ids.shape[0], -1, 2)
+                bwd_mask = torch.from_numpy(data_blob["bwd_mask"]).to(args.device).view(view_ids.shape[0], -1)
+                fwd_cam2cams, bwd_cam2cams = get_fwd_bwd_cam2cams(cam2world, view_ids - starting_frame_id)
+                        
+                pts = directions * depth_map[..., None]
+                pred_fwd_flow = get_pred_flow(
+                    pts, ij, fwd_cam2cams, local_tensorfs.focal(W), local_tensorfs.center(W, H))
+                pred_bwd_flow = get_pred_flow(
+                    pts, ij, bwd_cam2cams, local_tensorfs.focal(W), local_tensorfs.center(W, H))
+                flow_loss_arr =  torch.sum(torch.abs(pred_bwd_flow - bwd_flow), dim=-1) * bwd_mask
+                flow_loss_arr += torch.sum(torch.abs(pred_fwd_flow - fwd_flow), dim=-1) * fwd_mask
+                flow_loss_arr[flow_loss_arr > torch.quantile(flow_loss_arr, 0.9, dim=1)[..., None]] = 0
 
-            flow_loss = (flow_loss_arr).mean() * args.loss_flow_weight_inital * reg_loss_weight / ((W + H) / 2)
-            total_loss = total_loss + flow_loss
-            writer.add_scalar("train/flow_loss", flow_loss, global_step=iteration)
+                flow_loss = (flow_loss_arr).mean() * args.loss_flow_weight_inital * reg_loss_weight / ((W + H) / 2)
+                total_loss = total_loss + flow_loss
+                writer.add_scalar("train/flow_loss", flow_loss, global_step=iteration)
 
-        # Monocular Depth 
-        if local_tensorfs.regularize and args.loss_depth_weight_inital > 0:
-            if args.fov == 360:
-                raise NotImplementedError
-            invdepths = torch.from_numpy(data_blob["invdepths"]).to(args.device)
-            invdepths = invdepths.view(view_ids.shape[0], -1)
+            # Monocular Depth 
+            if local_tensorfs.regularize and args.loss_depth_weight_inital > 0:
+            # if False:
+                if args.fov == 360:
+                    raise NotImplementedError
+                invdepths = torch.from_numpy(data_blob["invdepths"]).to(args.device)
+                invdepths = invdepths.view(view_ids.shape[0], -1)
 
-            _, _, depth_loss_arr = compute_depth_loss(1 / depth_map.clamp(1e-6), invdepths)
-            depth_loss_arr[depth_loss_arr > torch.quantile(depth_loss_arr, 0.8, dim=1)[..., None]] = 0
+                _, _, depth_loss_arr = compute_depth_loss(1 / depth_map.clamp(1e-6), invdepths)
+                depth_loss_arr[depth_loss_arr > torch.quantile(depth_loss_arr, 0.8, dim=1)[..., None]] = 0
 
-            depth_loss = (depth_loss_arr).mean() * args.loss_depth_weight_inital * reg_loss_weight
-            total_loss = total_loss + depth_loss 
-            writer.add_scalar("train/depth_loss", depth_loss, global_step=iteration)
-            if args.use_dynamic:
-                dynamic_mask = dynamic_mask.view(view_ids.shape[0], -1)
-                valid_depth_s = dynamic_mask < 0.5
-                valid_depth_d = torch.logical_not(valid_depth_s)
+                depth_loss = (depth_loss_arr).mean() * args.loss_depth_weight_inital * reg_loss_weight
+                total_loss = total_loss + depth_loss 
+                writer.add_scalar("train/depth_loss", depth_loss, global_step=iteration)
+                if args.use_dynamic:
+                    dynamic_mask = dynamic_mask.view(view_ids.shape[0], -1)
+                    valid_depth_s = dynamic_mask < 0.5
+                    valid_depth_d = torch.logical_not(valid_depth_s)
 
-                _, _, depth_loss_arr_d = compute_depth_loss(1 / depth_map_dynamic[valid_depth_d].clamp(1e-6), invdepths[valid_depth_d])
-                # depth_loss_arr_d[depth_loss_arr_d > torch.quantile(depth_loss_arr_d, 0.8, dim=1)[..., None]] = 0
-                depth_loss_d = (depth_loss_arr_d).mean() * args.loss_depth_weight_inital * reg_loss_weight
-                total_loss = total_loss + depth_loss_d 
+                    _, _, depth_loss_arr_d = compute_depth_loss(1 / depth_map_dynamic[valid_depth_d].clamp(1e-6), invdepths[valid_depth_d])
+                    # depth_loss_arr_d[depth_loss_arr_d > torch.quantile(depth_loss_arr_d, 0.8, dim=1)[..., None]] = 0
+                    depth_loss_d = (depth_loss_arr_d).mean() * args.loss_depth_weight_inital * reg_loss_weight
+                    total_loss = total_loss + depth_loss_d 
 
-                _, _, depth_loss_arr_s = compute_depth_loss(1 / depth_map_static[valid_depth_s].clamp(1e-6), invdepths[valid_depth_s])
-                # depth_loss_arr_s[depth_loss_arr_s > torch.quantile(depth_loss_arr_s, 0.8, dim=1)[..., None]] = 0
-                depth_loss_s = depth_loss_arr_s.mean() * args.loss_depth_weight_inital * reg_loss_weight
-                total_loss = total_loss + depth_loss_s
+                    _, _, depth_loss_arr_s = compute_depth_loss(1 / depth_map_static[valid_depth_s].clamp(1e-6), invdepths[valid_depth_s])
+                    # depth_loss_arr_s[depth_loss_arr_s > torch.quantile(depth_loss_arr_s, 0.8, dim=1)[..., None]] = 0
+                    depth_loss_s = depth_loss_arr_s.mean() * args.loss_depth_weight_inital * reg_loss_weight
+                    total_loss = total_loss + depth_loss_s
 
-                # dynamic mask
-                if iteration>1000:
-                    mask_loss = torch.mean(
-                        torch.abs(pred_mask - dynamic_mask.view(-1).to(torch.float32))
-                    )
-                    total_loss += 0.1*mask_loss
-        if  local_tensorfs.regularize:
-            loss_tv, l1_loss = local_tensorfs.get_reg_loss(tvreg, args.TV_weight_density, args.TV_weight_app, args.L1_weight)
-            total_loss = total_loss + loss_tv + l1_loss
-            writer.add_scalar("train/loss_tv", loss_tv, global_step=iteration)
-            writer.add_scalar("train/l1_loss", l1_loss, global_step=iteration)
+                    # dynamic mask
+                    if iteration>1000:
+                        mask_loss = torch.mean(
+                            torch.abs(pred_mask - dynamic_mask.view(-1).to(torch.float32))
+                        )
+                        total_loss += 0.1*mask_loss
+            if local_tensorfs.regularize:
+                if not args.use_emer:
+                    loss_tv, l1_loss = local_tensorfs.get_reg_loss(tvreg, args.TV_weight_density, args.TV_weight_app, args.L1_weight)
+                    total_loss = total_loss + loss_tv + l1_loss
+                    writer.add_scalar("train/loss_tv", loss_tv, global_step=iteration)
+                    writer.add_scalar("train/l1_loss", l1_loss, global_step=iteration)
 
         # Optimizes
         if train_test_poses:
@@ -527,16 +568,16 @@ def reconstruction(args):
         ## Log
         loss = loss.detach().item()
 
-        writer.add_scalar(
-            "train/density_app_plane_lr",
-            local_tensorfs.rf_optimizer.param_groups[0]["lr"],
-            global_step=iteration,
-        )
-        writer.add_scalar(
-            "train/basis_mat_lr",
-            local_tensorfs.rf_optimizer.param_groups[4]["lr"],
-            global_step=iteration,
-        )
+        # writer.add_scalar(
+        #     "train/density_app_plane_lr",
+        #     local_tensorfs.rf_optimizer.param_groups[0]["lr"],
+        #     global_step=iteration,
+        # )
+        # writer.add_scalar(
+        #     "train/basis_mat_lr",
+        #     local_tensorfs.rf_optimizer.param_groups[4]["lr"],
+        #     global_step=iteration,
+        # )
 
         writer.add_scalar(
             "train/lr_r",
@@ -597,6 +638,8 @@ def reconstruction(args):
 
         if (iteration % args.vis_every == args.vis_every - 1):
             poses_mtx = local_tensorfs.get_cam2world().detach()
+            if args.enable_gt_poses:
+                poses_mtx = waymodataset.pixel_source.cam_to_worlds[:poses_mtx.shape[0],:3]
             rgb_maps_tb, depth_maps_tb, gt_rgbs_tb, fwd_flow_cmp_tb, bwd_flow_cmp_tb, depth_err_tb, loc_metrics = render(
                 test_dataset,
                 poses_mtx,
@@ -610,6 +653,7 @@ def reconstruction(args):
                 train_dataset=train_dataset,
                 start=train_dataset.active_frames_bounds[0],
                 add_frame_to_list= not args.skip_TB_images, # skip_TB_images=True if set; add_frame_to_list=False to save RAM --> not args.skip_TB_images
+                dataset=waymodataset,
             )
 
             if len(loc_metrics.values()):
@@ -702,6 +746,8 @@ if __name__ == "__main__":
 
     args = config_parser()
     print(args)
+
+    cfg = setup(args)
 
     if args.render_only:
         render_test(args)
